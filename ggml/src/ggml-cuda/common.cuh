@@ -1606,6 +1606,39 @@ struct ggml_cuda_kernel_launch_params {
         : block_nums(block_nums_), block_dims(block_dims_), shmem((size_t)shmem_), stream(stream_) {}
 };
 
+// gfx1201 dispatch stall (ROCm/TheRock#8634): on RDNA4 a launch whose total thread count is a
+// multiple of 65536, or within the last max(4 blocks, 16 waves) below one, takes ~9 us longer
+// than its neighbours regardless of grid shape (measured on an R9700 with ROCm 10.1, see
+// infra/compute-hub/llama-server-rocm10/). Kernels that index rows by blockIdx.x and bounds-check
+// against the row count can pad gridDim.x out of that window. Returns the number of padded blocks.
+// GGML_CUDA_GRID_STALL_PAD=0 disables the pad (A/B switch).
+static inline unsigned ggml_cuda_grid_stall_pad(dim3 & block_nums, const dim3 & block_dims) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_GRID_STALL_PAD");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    if (!enabled || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        return 0;
+    }
+    const uint64_t nthreads_block = (uint64_t) block_dims.x*block_dims.y*block_dims.z;
+    const uint64_t window         = std::max<uint64_t>(4*nthreads_block, 16*WARP_SIZE);
+    unsigned pad = 0;
+    for (; pad < 64; ++pad) {
+        const uint64_t total = (uint64_t) block_nums.x*block_nums.y*block_nums.z*nthreads_block;
+        const uint64_t rem   = total % 65536;
+        if (rem != 0 && rem <= 65536 - window) {
+            break;
+        }
+        block_nums.x++;
+    }
+    return pad;
+#else
+    GGML_UNUSED_VARS(block_nums, block_dims);
+    return 0;
+#endif // defined(GGML_USE_HIP)
+}
+
 #if defined(GGML_CUDA_USE_PDL)
 struct ggml_cuda_pdl_config {
     cudaLaunchAttribute attr;
