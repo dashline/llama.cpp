@@ -1353,6 +1353,32 @@ uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
 }
 
+bool llama_memory_recurrent_context::is_rs_contiguous() const {
+    if (is_full || mem == nullptr) {
+        return false;
+    }
+
+    const llama_ubatch & ubatch = get_ubatch();
+    if (mem->n != ubatch.n_seqs) {
+        return false;
+    }
+
+    for (uint32_t s = 0; s < mem->n; ++s) {
+        const uint32_t cell_idx = s + mem->head;
+        if (mem->cells[cell_idx].src0 != (int32_t) cell_idx) {
+            return false;
+        }
+        if (mem->n_rs_seq > 0 && !mem->cells[cell_idx].seq_id.empty()) {
+            const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+            if (seq >= 0 && (size_t) seq < mem->rs_idx.size() && mem->rs_idx[seq] != 0) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
 }

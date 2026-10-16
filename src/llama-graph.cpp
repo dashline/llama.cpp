@@ -387,13 +387,17 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_n_rs();
 
-    if (s_copy) {
+    if (s_copy && s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
+        }
+    } else {
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            (void) mctx->s_copy(i);
         }
     }
 }
@@ -411,6 +415,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= rs_contiguous == mctx->is_rs_contiguous();
 
     return res;
 }
@@ -1162,13 +1167,17 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
+        }
+    } else {
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            (void) mctx->get_recr()->s_copy(i);
         }
     }
 }
@@ -1191,6 +1200,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_contiguous == mctx->get_recr()->is_rs_contiguous();
 
     return res;
 }
@@ -1205,13 +1215,17 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
+        }
+    } else {
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            (void) mctx->get_recr()->s_copy(i);
         }
     }
 }
@@ -1233,6 +1247,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_contiguous == mctx->get_recr()->is_rs_contiguous();
 
     return res;
 }
@@ -1278,13 +1293,17 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
+        }
+    } else {
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            (void) mctx->get_recr()->s_copy(i);
         }
     }
 }
@@ -1320,6 +1339,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->rs_contiguous == mctx->get_recr()->is_rs_contiguous();
 
     return res;
 }
@@ -3821,8 +3841,9 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
 
-    inp->head = mctx_cur->get_head();
-    inp->rs_z = mctx_cur->get_rs_z();
+    inp->head          = mctx_cur->get_head();
+    inp->rs_z          = mctx_cur->get_rs_z();
+    inp->rs_contiguous = mctx_cur->is_rs_contiguous();
 
     return inp;
 }
@@ -3840,8 +3861,24 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
             int32_t   state_size,
             int32_t   n_seqs,
-        const llm_graph_get_rows_fn & get_state_rows) const {
+        const llm_graph_get_rows_fn & get_state_rows,
+               bool   zero_copy) const {
     const auto * kv_state = inp->mctx;
+
+    // Opt-in per caller: the returned view aliases `s`, so every reader must be a (transitive)
+    // dependency of every writer of those rows.
+    if (zero_copy && inp->rs_contiguous && !get_state_rows && cparams.fused_gdn_ar && cparams.fused_gdn_ch) {
+        const uint32_t rs_head = kv_state->get_head();
+        const int32_t  rs_zero = kv_state->get_rs_z();
+        ggml_tensor *  states  = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+
+        ggml_tensor * output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head * states->nb[1]);
+        ggml_build_forward_expand(gf, output_states);
+        return output_states;
+    }
 
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch

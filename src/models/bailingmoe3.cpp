@@ -282,8 +282,10 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
             q = build_gdn_l2_norm(ctx0, q, hparams.f_norm_rms_eps);
             k = build_gdn_l2_norm(ctx0, k, hparams.f_norm_rms_eps);
 
+            // Zero-copy view into states_all when slots are contiguous: GDN is the sole reader and
+            // directly precedes the state snapshot write in build_recurrent_attn.
             ggml_tensor * states_all = mctx_cur->get_s_l(il);
-            ggml_tensor * state = build_rs(inp_rs, states_all, hparams.n_embd_s(), n_seqs);
+            ggml_tensor * state = build_rs(inp_rs, states_all, hparams.n_embd_s(), n_seqs, nullptr, /*zero_copy=*/ true);
             state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
 
             ggml_tensor * out = ggml_cont(ctx0, build_recurrent_attn(
