@@ -2469,7 +2469,8 @@ private:
         return true;
     }
 
-    // idle slots that lose the least by being reused: empty slots first, then the least recently used ones
+    // idle slots that lose the least by being reused: empty slots first, then lowest slot id under !kv_unified
+    // or least recently used under kv_unified
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
@@ -2478,9 +2479,12 @@ private:
             }
         }
 
-        std::stable_sort(free_slots.begin(), free_slots.end(), [](const server_slot * a, const server_slot * b) {
+        std::stable_sort(free_slots.begin(), free_slots.end(), [this](const server_slot * a, const server_slot * b) {
             if ((a->prompt.n_tokens() == 0) != (b->prompt.n_tokens() == 0)) {
                 return a->prompt.n_tokens() == 0;
+            }
+            if (!params_base.kv_unified) {
+                return a->id < b->id;
             }
             return a->t_last_used < b->t_last_used;
         });
