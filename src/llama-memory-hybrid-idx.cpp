@@ -326,7 +326,7 @@ static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::sl
     res.reserve(sinfos.size());
 
     for (const auto & sinfo : sinfos) {
-        res.push_back(sinfo.s1 - sinfo.s0 + 1);
+        res.push_back(sinfo.n_stream());
     }
 
     return res;
