@@ -713,11 +713,16 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     const ggml_tensor * unary_src = unary_node->src[0];  // input to the unary op
     const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
 
+    const bool other_bcast_1d = ggml_is_contiguous(other_src) &&
+                                other_src->ne[0] == unary_src->ne[0] &&
+                                ggml_nrows(other_src) == 1 &&
+                                ggml_is_contiguous(unary_src);
+
     GGML_ASSERT(ggml_is_contiguous_1(unary_src));
     GGML_ASSERT(unary_src->nb[0] == ggml_element_size(unary_src));
     GGML_ASSERT(ggml_is_contiguous_1(other_src));
     GGML_ASSERT(other_src->nb[0] == ggml_element_size(other_src));
-    GGML_ASSERT(ggml_are_same_shape(unary_src, other_src));
+    GGML_ASSERT(ggml_are_same_shape(unary_src, other_src) || other_bcast_1d);
 
     GGML_ASSERT(unary_src->type == GGML_TYPE_F32 || unary_src->type == GGML_TYPE_F16 || unary_src->type == GGML_TYPE_BF16);
     GGML_ASSERT(unary_src->type == other_src->type);
@@ -728,7 +733,7 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     const int64_t k  = ggml_nelements(mul_node);
     const int64_t nc = unary_src->ne[0];
     const int64_t unary_stride = unary_src->nb[1];
-    const int64_t other_stride = other_src->nb[1];
+    const int64_t other_stride = other_bcast_1d ? 0 : (int64_t) other_src->nb[1];
 
     if (unary_src->type == GGML_TYPE_F16) {
         unary_gated_cuda<op>((const half *) unary_src->data, (const half *) other_src->data,
@@ -758,6 +763,90 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
             break;
         default:
             GGML_ABORT("Unsupported unary op for fused unary+mul");
+    }
+}
+
+/* fused add + unary + mul */
+
+template <float (*op)(float), typename T>
+static __global__ void add_unary_gated_op_kernel(const T * x, const T * b, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t ox, const int64_t ob, const int64_t og) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = i / n;
+    const int64_t col = i % n;
+    const int64_t jx  = row * ox + col;
+    const int64_t jb  = row * ob + col;
+    const int64_t jg  = row * og + col;
+
+    ggml_cuda_pdl_sync();
+    const float val = ggml_cuda_cast<float>(x[jx]) + ggml_cuda_cast<float>(b[jb]);
+    dst[i] = ggml_cuda_cast<T>(op(val) * ggml_cuda_cast<float>(g[jg]));
+}
+
+template <float (*op)(float), typename T>
+static void add_unary_gated_cuda(const T * x, const T * b, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t ox, const int64_t ob, const int64_t og, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(add_unary_gated_op_kernel<op, T>, launch_params, x, b, g, dst, k, n, ox, ob, og);
+}
+
+template <float (*op)(float)>
+static void ggml_cuda_op_add_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    GGML_UNUSED(unary_node);
+    const ggml_tensor * x_src = ggml_are_same_shape(add_node, add_node->src[0]) ? add_node->src[0] : add_node->src[1];
+    const ggml_tensor * b_src = (x_src == add_node->src[0]) ? add_node->src[1] : add_node->src[0];
+    const ggml_tensor * g_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+
+    const bool b_bcast_1d = ggml_is_contiguous(b_src) && b_src->ne[0] == x_src->ne[0] && ggml_nrows(b_src) == 1 && ggml_is_contiguous(x_src);
+    const bool g_bcast_1d = ggml_is_contiguous(g_src) && g_src->ne[0] == x_src->ne[0] && ggml_nrows(g_src) == 1 && ggml_is_contiguous(x_src);
+
+    GGML_ASSERT(ggml_is_contiguous_1(x_src) && x_src->nb[0] == ggml_element_size(x_src));
+    GGML_ASSERT(ggml_is_contiguous_1(b_src) && b_src->nb[0] == ggml_element_size(b_src));
+    GGML_ASSERT(ggml_is_contiguous_1(g_src) && g_src->nb[0] == ggml_element_size(g_src));
+    GGML_ASSERT(ggml_are_same_shape(x_src, b_src) || b_bcast_1d);
+    GGML_ASSERT(ggml_are_same_shape(x_src, g_src) || g_bcast_1d);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t k  = ggml_nelements(mul_node);
+    const int64_t nc = x_src->ne[0];
+    const int64_t ox = x_src->nb[1];
+    const int64_t ob = b_bcast_1d ? 0 : (int64_t) b_src->nb[1];
+    const int64_t og = g_bcast_1d ? 0 : (int64_t) g_src->nb[1];
+
+    if (x_src->type == GGML_TYPE_F16) {
+        add_unary_gated_cuda<op>((const half *) x_src->data, (const half *) b_src->data, (const half *) g_src->data,
+                                 (half *) mul_node->data, k, nc,
+                                 ox / sizeof(half), ob / sizeof(half), og / sizeof(half), stream);
+    } else if (x_src->type == GGML_TYPE_BF16) {
+        add_unary_gated_cuda<op>((const nv_bfloat16 *) x_src->data, (const nv_bfloat16 *) b_src->data, (const nv_bfloat16 *) g_src->data,
+                                 (nv_bfloat16 *) mul_node->data, k, nc,
+                                 ox / sizeof(nv_bfloat16), ob / sizeof(nv_bfloat16), og / sizeof(nv_bfloat16), stream);
+    } else {
+        add_unary_gated_cuda<op>((const float *) x_src->data, (const float *) b_src->data, (const float *) g_src->data,
+                                 (float *) mul_node->data, k, nc,
+                                 ox / sizeof(float), ob / sizeof(float), og / sizeof(float), stream);
+    }
+}
+
+void ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SILU:
+            ggml_cuda_op_add_unary_mul_impl<op_silu>(ctx, add_node, unary_node, mul_node);
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            ggml_cuda_op_add_unary_mul_impl<op_sigmoid>(ctx, add_node, unary_node, mul_node);
+            break;
+        case GGML_UNARY_OP_SOFTPLUS:
+            ggml_cuda_op_add_unary_mul_impl<op_softplus>(ctx, add_node, unary_node, mul_node);
+            break;
+        default:
+            GGML_ABORT("Unsupported unary op for fused add+unary+mul");
     }
 }
 
