@@ -5728,29 +5728,39 @@ struct test_mul_mat_id_fusion : public test_case {
 struct test_mul_mat_id_shared : public test_case {
     const ggml_type type;
     const int64_t n;
-    ggml_tensor * routed = nullptr;
-    ggml_tensor * shared = nullptr;
+    const int n_layers;
+    std::vector<ggml_tensor *> fused_outputs;
 
-    test_mul_mat_id_shared(ggml_type type, int64_t n) : type(type), n(n) {}
+    test_mul_mat_id_shared(ggml_type type, int64_t n, int n_layers = 1) : type(type), n(n), n_layers(n_layers) {}
 
-    std::string vars() override { return VARS_TO_STR2(type, n); }
+    std::string vars() override {
+        return n_layers == 1 ? VARS_TO_STR2(type, n) : VARS_TO_STR3(type, n, n_layers);
+    }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { routed, shared }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return fused_outputs; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n);
-        ggml_tensor * input_ids = ggml_reshape_3d(ctx, input, 512, 1, n);
-        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n);
-        ggml_set_name(ids, "ids");
-        ggml_tensor * up = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
-        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
-        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
-        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
-        routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
-        shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
-        return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
+        fused_outputs.clear();
+        ggml_tensor * out = nullptr;
+        for (int l = 0; l < n_layers; ++l) {
+            ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n);
+            ggml_tensor * input_ids = ggml_reshape_3d(ctx, input, 512, 1, n);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n);
+            ggml_set_name(ids, l == 0 ? "ids" : "ids_l1");
+            ggml_tensor * up = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
+            ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
+            ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
+            ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
+            ggml_tensor * routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
+            ggml_tensor * shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
+            fused_outputs.push_back(routed);
+            fused_outputs.push_back(shared);
+            ggml_tensor * combined = ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
+            out = out ? ggml_add(ctx, out, combined) : combined;
+        }
+        return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -11068,9 +11078,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
-    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+    for (ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+        }
+    }
+    // Chained multi-layer MUL_MAT_ID at n=5..9 exercises the sorted get_rows fallback
+    // across distinct activations in the same graph (regression test for q8_1 cache invalidation).
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
+        for (int64_t n : { 5, 8, 9 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(type, n, /*n_layers =*/ 2));
         }
     }
 
@@ -11979,7 +11996,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, 1, 32, 256,
                                     use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
                                 // multi-token batches (spec decoding)
-                                for (int64_t m_batch : { 2, 4, 8 }) {
+                                for (int64_t m_batch : { 2, 3, 4, 8 }) {
                                     test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 32, 256,
                                         use_id, 16, 8, b, with_bias, with_gate, with_lane_scale, {1, 1}));
                                 }
