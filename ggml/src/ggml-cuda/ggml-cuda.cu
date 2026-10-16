@@ -1839,7 +1839,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
-    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP };
+    static constexpr std::array<ggml_glu_op, 5> valid_glu_ops = {
+        GGML_GLU_OP_REGLU, GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_CLAMP
+    };
 
     if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
         return false;
@@ -4702,6 +4704,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
+            const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+            const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+            const bool mmq_glu_op_ok = glu_op == GGML_GLU_OP_REGLU ||
+                                       glu_op == GGML_GLU_OP_GEGLU ||
+                                       glu_op == GGML_GLU_OP_SWIGLU;
+            const bool moe_mmq_type = src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K ||
+                                      src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q8_0 ||
+                                      src0->type == GGML_TYPE_Q6_K;
+            if (op == GGML_OP_MUL_MAT_ID && ids != nullptr && mmq_glu_op_ok &&
+                    ggml_cuda_should_fuse_mul_mat(up, gate, glu) &&
+                    !ggml_cuda_mmq_needs_fallback(src0->ne[1]) &&
+                    mmq_rdna3_5_id_n_experts_ok(src0->ne[2]) &&
+                    (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && moe_mmq_type &&
+                    ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.gate      = gate->src[0];
+                fusion_data.glu_op    = glu_op;
+                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+
+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;

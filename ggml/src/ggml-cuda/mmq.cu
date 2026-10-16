@@ -131,8 +131,103 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+static void ggml_cuda_mul_mat_q_switch_type_gate(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
+#if defined(GGML_USE_HIP)
+    GGML_ASSERT(prec_src1 == GGML_PREC_Q8);
+    switch (args.type_x) {
+        case GGML_TYPE_Q3_K:
+            mul_mat_q_case<GGML_TYPE_Q3_K, GGML_PREC_Q8, true>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_K:
+            mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8, true>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            mul_mat_q_case<GGML_TYPE_Q5_K, GGML_PREC_Q8, true>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            mul_mat_q_case<GGML_TYPE_Q8_0, GGML_PREC_Q8, true>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            mul_mat_q_case<GGML_TYPE_Q6_K, GGML_PREC_Q8, true>(ctx, args, stream);
+            break;
+        default:
+            fprintf(stderr, "gate type = %d\n", (int) args.type_x);
+            GGML_ABORT("fatal error: fused gate MMQ not implemented for this type");
+            break;
+    }
+#else
+    GGML_UNUSED_VARS(ctx, args, stream, prec_src1);
+    GGML_ABORT("fatal error: fused gate MMQ only implemented for HIP");
+#endif // defined(GGML_USE_HIP)
+}
+
+static void ggml_cuda_mmq_select_J(const ggml_type type, const bool fallback, const int cc, const size_t smpbo,
+        const ggml_prec prec_src1, const int64_t ncols_opt,
+        const bool has_ids, const int64_t nchannels_y, const int64_t ncols_dst, const bool has_gate,
+        int & J_best, int & nthreads_best) {
+    J_best = 0;
+    nthreads_best = 0;
+    int ntiles_J_best = INT_MAX;
+
+    int J_cap = 128;
+    if (has_gate) {
+        const int J_max_gate = (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA3_0(cc))
+            ? (type == GGML_TYPE_Q6_K ? 64 :
+               type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 96 :
+               type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q3_K ? 64 : 128)
+            : 128;
+        J_cap = std::min(J_cap, J_max_gate);
+    }
+
+    if (has_ids && mmq_rdna3_5_id_n_experts_ok(nchannels_y) && mmq_routed_compact_arch_ok(cc) && !fallback) {
+        if ((type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS) &&
+                (ncols_dst + nchannels_y - 1) / nchannels_y == 48) {
+            constexpr int J_rdna3_5 = 48;
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_rdna3_5, fallback, cc, prec_src1);
+            if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                J_best = J_rdna3_5;
+                nthreads_best = config.nthreads;
+                ntiles_J_best = 1;
+            }
+        } else {
+            const int64_t rows_per_expert = (ncols_dst + nchannels_y - 1) / nchannels_y;
+            const bool use_j48_128e = mmq_rdna3_5_id_use_j48_128e(type, nchannels_y, rows_per_expert);
+            int J_rdna3_5 = use_j48_128e ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert, GGML_CUDA_CC_IS_RDNA4(cc));
+            J_rdna3_5 = std::min(J_rdna3_5, J_cap);
+            while (J_rdna3_5 > 0 && !mmq_rdna3_5_id_use_compact(type, J_rdna3_5, GGML_CUDA_CC_IS_RDNA4(cc))) {
+                J_rdna3_5 -= 16;
+            }
+            if (J_rdna3_5 != 0) {
+                const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_rdna3_5, fallback, cc, prec_src1);
+                if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                    J_best = J_rdna3_5;
+                    nthreads_best = config.nthreads;
+                    ntiles_J_best = 1;
+                }
+            }
+        }
+    }
+
+    for (int J = 8; J <= J_cap && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
+        if (config.type == GGML_TYPE_COUNT) {
+            continue;
+        }
+        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+        const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
+        if (ntiles_x < ntiles_J_best) {
+            J_best = J;
+            nthreads_best = config.nthreads;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+}
+
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -190,9 +285,11 @@ void ggml_cuda_mul_mat_q(
     int nthreads_best = 0;
     {
         int64_t ncols_opt = ne11;
+        int64_t ncols_dst = ne11;
         if (ids) {
             const int64_t n_expert_used = ids->ne[0];
             ncols_opt = ne12;
+            ncols_dst = ne12 * n_expert_used;
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
             // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
@@ -200,27 +297,9 @@ void ggml_cuda_mul_mat_q(
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
             }
         }
-
-        int ntiles_J_best = INT_MAX;
-
-        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
-            if (config.type == GGML_TYPE_COUNT) {
-                continue;
-            }
-
-            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
-                continue;
-            }
-
-            const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
-
-            if (ntiles_x < ntiles_J_best) {
-                J_best = J;
-                nthreads_best = config.nthreads;
-                ntiles_J_best = ntiles_x;
-            }
-        }
+        ggml_cuda_mmq_select_J(src0->type, fallback, cc, smpbo, prec_src1, ncols_opt,
+            /*has_ids=*/ids != nullptr, /*nchannels_y=*/ids != nullptr ? ne02 : 1, ncols_dst,
+            /*has_gate=*/(fusion != nullptr && fusion->gate != nullptr), J_best, nthreads_best);
     }
     GGML_ASSERT(J_best > 0);
 
@@ -348,6 +427,18 @@ void ggml_cuda_mul_mat_q(
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, J_best};
+
+    if (fusion && fusion->gate) {
+        GGML_ASSERT(fusion->gate->type == src0->type);
+        GGML_ASSERT(fusion->gate->nb[1] == src0->nb[1] && fusion->gate->nb[2] == src0->nb[2] && fusion->gate->nb[3] == src0->nb[3]);
+        GGML_ASSERT(fusion->gate->ne[0] == src0->ne[0] && fusion->gate->ne[1] == src0->ne[1] && fusion->gate->ne[2] == src0->ne[2]);
+        mmq_args args_gate = args;
+        args_gate.x_gate    = (const char *) fusion->gate->data;
+        args_gate.glu_op    = fusion->glu_op;
+        args_gate.glu_limit = fusion->glu_limit;
+        ggml_cuda_mul_mat_q_switch_type_gate(ctx, args_gate, stream, prec_src1);
+        return;
+    }
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

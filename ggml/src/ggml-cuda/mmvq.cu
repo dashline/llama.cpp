@@ -262,7 +262,6 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
         case GGML_TYPE_IQ2_XXS: return 4;
         case GGML_TYPE_IQ3_S:   return 4;
         case GGML_TYPE_IQ3_XXS: return 4;
-        case GGML_TYPE_Q3_K:    return 4;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -824,6 +823,9 @@ static __global__ void mul_mat_vec_q(
                         }
                         gate_value += gate_biases[j];
                         switch (active_glu) {
+                            case GGML_GLU_OP_REGLU:
+                                result *= fmaxf(gate_value, 0.0f);
+                                break;
                             case GGML_GLU_OP_SWIGLU:
                                 result *= ggml_cuda_op_silu_single(gate_value);
                                 break;
@@ -1021,6 +1023,9 @@ static __global__ void mul_mat_vec_q_moe(
                     gate_value += gate_bias[bias_idx];
                 }
                 switch (active_glu) {
+                    case GGML_GLU_OP_REGLU:
+                        result *= fmaxf(gate_value, 0.0f);
+                        break;
                     case GGML_GLU_OP_SWIGLU:
                         result *= ggml_cuda_op_silu_single(gate_value);
                         break;
