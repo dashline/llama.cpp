@@ -10,13 +10,13 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
     return 128;
 }
 
-// Block-per-lane quantized K, wide V, and GQA batching (ncols2 > 1) are only enabled on RDNA4:
+// Block-per-lane quantized K, wide V, and GQA batching (ncols2 > 1) are only enabled on RDNA3/RDNA4:
 static constexpr __device__ bool ggml_cuda_fattn_vec_blk_available() {
-#if defined(GGML_USE_HIP) && defined(RDNA4)
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
     return true;
 #else
     return false;
-#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+#endif // defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
 }
 
 // Currently llvm with the amdgcn target does not support unrolling loops
@@ -84,7 +84,7 @@ static __global__ void flash_attn_ext_vec(
 
     // KQ_blk: block-per-lane q8_0 / q4_0 K, D/32 lanes per K row (load_fattn_vec_K_blk / vec_dot_fattn_vec_KQ_blk).
     // V_wide: 8 V elements per lane per row; not with strided q4_1 / q5_0 / q5_1 K, that pairing spills on RDNA4.
-    constexpr bool KQ_blk = ggml_cuda_fattn_vec_blk_available() && D == 256 && (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0);
+    constexpr bool KQ_blk = ggml_cuda_fattn_vec_blk_available() && (D == 128 || D == 256) && (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0);
     constexpr bool V_wide = ggml_cuda_fattn_vec_blk_available() && D == 256 && (type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_Q4_0)
         && (KQ_blk || type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16);
 
@@ -649,7 +649,7 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
 #ifdef GGML_USE_HIP
     // GQA head batching: ncols2 Q heads of one KV head per block, so the K/V stream is read once per KV head.
-    if constexpr (D == 256 &&
+    if constexpr ((D == 128 || D == 256) &&
             (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0) &&
             (type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_Q4_0)) {
         const ggml_tensor * K    = dst->src[1];
@@ -662,8 +662,8 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         const int gqa_ratio = Q->ne[2] / K->ne[2];
 
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        const bool use_gqa_opt = GGML_CUDA_CC_IS_RDNA4(cc) && mask && max_bias == 0.0f && logit_softcap == 0.0f &&
-            K->ne[1] % FATTN_KQ_STRIDE == 0;
+        const bool use_gqa_opt = (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) &&
+            mask && max_bias == 0.0f && logit_softcap == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, 8, type_K, type_V, false>(ctx, dst);
