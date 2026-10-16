@@ -11258,6 +11258,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,   2, false, 512,  n, 256,  1e5f));
     }
 
+    // test multi-warp MoE MMVQ (nwarps_per_token = 2/4 and n = 2..8)
+    for (int n : {2, 3, 4, 6, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 8, 2, false, 256, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q4_K, GGML_TYPE_F32, 8, 2, false, 256, n, 2048, 1, true));
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {
