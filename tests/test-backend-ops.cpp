@@ -4935,15 +4935,27 @@ struct test_gated_delta_net : public test_case {
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
 
+    const int32_t prologue; // 0 = separate L2_NORM, 1 = 5-node QK RMS_NORM+SCALE prologue, 2 = 10-node full prologue
+    ggml_tensor * gdn_node = nullptr;
+
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K)
+            + (prologue > 0 ? ",prologue=" + std::to_string(prologue) : "");
+    }
+
+    bool run_whole_graph() override { return prologue > 0; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (prologue > 0 && gdn_node != nullptr) {
+            return { gdn_node };
+        }
+        return {};
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, int32_t prologue = 0)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), prologue(prologue) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -4962,17 +4974,47 @@ struct test_gated_delta_net : public test_case {
         ggml_set_name(q, "q");
         ggml_set_name(k, "k");
         ggml_set_name(v, "v");
+        const int64_t H_v   = head_count * v_repeat;
         const int64_t g_ne0 = kda ? head_size : 1;
-        ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, g_ne0, head_count * v_repeat, n_seq_tokens, n_seqs);
-        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
-        ggml_set_name(g,     "g");
-        ggml_set_name(beta,  "beta");
+        ggml_tensor * g     = nullptr;
+        ggml_tensor * beta  = nullptr;
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, H_v, n_seqs);
         ggml_set_name(state, "state");
-        // q/k are L2-normalised in qwen35/kimi-linear before delta_net
-        q = ggml_l2_norm(ctx, q, 1e-6f);
-        k = ggml_l2_norm(ctx, k, 1e-6f);
-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+
+        if (prologue > 0) {
+            const float inv_sqrt_d = 1.0f / std::sqrt((float) head_size);
+            q = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f), inv_sqrt_d);
+            k = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f), inv_sqrt_d);
+        } else {
+            // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+            q = ggml_l2_norm(ctx, q, 1e-6f);
+            k = ggml_l2_norm(ctx, k, 1e-6f);
+        }
+
+        if (prologue == 2) {
+            ggml_tensor * raw_alpha = ggml_new_tensor_3d(ctx, type, H_v, n_seq_tokens, n_seqs);
+            ggml_tensor * dt_bias   = ggml_new_tensor_1d(ctx, type, H_v);
+            ggml_tensor * ssm_a     = ggml_new_tensor_1d(ctx, type, H_v);
+            ggml_tensor * raw_beta  = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
+            ggml_set_name(raw_alpha, "raw_alpha");
+            ggml_set_name(dt_bias,   "dt_bias");
+            ggml_set_name(ssm_a,     "ssm_a");
+            ggml_set_name(raw_beta,  "raw_beta");
+
+            ggml_tensor * alpha_biased   = ggml_add(ctx, raw_alpha, dt_bias);
+            ggml_tensor * alpha_softplus = ggml_softplus(ctx, alpha_biased);
+            ggml_tensor * gate           = ggml_mul(ctx, alpha_softplus, ssm_a);
+            g    = ggml_reshape_4d(ctx, gate, 1, H_v, n_seq_tokens, n_seqs);
+            beta = ggml_sigmoid(ctx, raw_beta);
+        } else {
+            g    = ggml_new_tensor_4d(ctx, type, g_ne0, H_v, n_seq_tokens, n_seqs);
+            beta = ggml_new_tensor_4d(ctx, type, 1, H_v, n_seq_tokens, n_seqs);
+            ggml_set_name(g,    "g");
+            ggml_set_name(beta, "beta");
+        }
+
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        gdn_node = out;
         return out;
     }
 
@@ -4981,6 +5023,10 @@ struct test_gated_delta_net : public test_case {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
                 init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "ssm_a") == 0) {
+                init_tensor_uniform(t, -5.0f, -1e-3f);
+            } else if (strcmp(t->name, "raw_alpha") == 0 || strcmp(t->name, "dt_bias") == 0 || strcmp(t->name, "raw_beta") == 0) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
@@ -12021,6 +12067,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // gdn prologue fusion: 5-node (QK RMS_NORM + SCALE) and 10-node (QK norm + gate + beta sigmoid)
+    for (int32_t prologue : { 1, 2 }) {
+        for (int64_t S_v : { 64, 128 }) {
+            for (int64_t n_tok : { 1, 7, 63 }) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, S_v, n_tok, 1, /*v_repeat=*/2, false, false, /*K=*/1, prologue));
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, S_v, n_tok, 2, /*v_repeat=*/2, false, false, /*K=*/2, prologue));
+            }
+        }
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

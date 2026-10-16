@@ -2950,6 +2950,233 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+                                                 const int           node_idx,
+                                                 const int           node_count,
+                                                 const int *         out_nodes,
+                                                 const int           out_count,
+                                                 const bool          is_topk_moe = false);
+
+// match the GDN prologue subgraph (q/k L2 norm, optional alpha gate + dt_bias + ssm_a, optional beta sigmoid)
+// directly preceding GGML_OP_GATED_DELTA_NET so gated_delta_net_cuda can evaluate them in registers.
+static bool ggml_cuda_try_gdn_prologue_fusion(
+        const ggml_cgraph * cgraph,
+        int node_idx,
+        ggml_cuda_gated_delta_net_fusion_args & args,
+        int & gdn_idx,
+        bool check_mem_ranges) {
+    args    = {};
+    gdn_idx = -1;
+
+    if (node_idx + 4 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * q_rms = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * q_scl = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * k_rms = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * k_scl = cgraph->nodes[node_idx + 3];
+
+    if (q_rms->op != GGML_OP_RMS_NORM || q_scl->op != GGML_OP_SCALE ||
+        k_rms->op != GGML_OP_RMS_NORM || k_scl->op != GGML_OP_SCALE) {
+        return false;
+    }
+    if (q_scl->src[0] != q_rms || k_scl->src[0] != k_rms) {
+        return false;
+    }
+    if (q_rms->type != GGML_TYPE_F32 || q_scl->type != GGML_TYPE_F32 ||
+        k_rms->type != GGML_TYPE_F32 || k_scl->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // SCALE bias must be 0.0f
+    if (ggml_get_op_params_f32(q_scl, 1) != 0.0f || ggml_get_op_params_f32(k_scl, 1) != 0.0f) {
+        return false;
+    }
+
+    const float q_eps   = ggml_get_op_params_f32(q_rms, 0);
+    const float k_eps   = ggml_get_op_params_f32(k_rms, 0);
+    const float q_scale = ggml_get_op_params_f32(q_scl, 0);
+    const float k_scale = ggml_get_op_params_f32(k_scl, 0);
+    if (q_eps <= 0.0f || k_eps <= 0.0f || q_scale <= 0.0f || k_scale <= 0.0f) {
+        return false;
+    }
+
+    const ggml_tensor * raw_q = q_rms->src[0];
+    const ggml_tensor * raw_k = k_rms->src[0];
+    if (!raw_q || !raw_k || raw_q->type != GGML_TYPE_F32 || raw_k->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous_rows(raw_q) || !ggml_is_contiguous_rows(raw_k) ||
+        !ggml_are_same_stride(raw_q, raw_k)) {
+        return false;
+    }
+
+    bool full_prologue = false;
+    const ggml_tensor * gdn        = nullptr;
+    const ggml_tensor * add_node   = nullptr;
+    const ggml_tensor * sp_node    = nullptr;
+    const ggml_tensor * mul_node   = nullptr;
+    const ggml_tensor * resh_node  = nullptr;
+    const ggml_tensor * sig_node   = nullptr;
+    const ggml_tensor * raw_alpha  = nullptr;
+    const ggml_tensor * dt_bias    = nullptr;
+    const ggml_tensor * ssm_a      = nullptr;
+    const ggml_tensor * raw_beta   = nullptr;
+
+    if (node_idx + 9 < cgraph->n_nodes &&
+        cgraph->nodes[node_idx + 9]->op == GGML_OP_GATED_DELTA_NET) {
+        static const ggml_op full_ops[10] = {
+            GGML_OP_RMS_NORM,
+            GGML_OP_SCALE,
+            GGML_OP_RMS_NORM,
+            GGML_OP_SCALE,
+            GGML_OP_ADD,
+            GGML_OP_UNARY,
+            GGML_OP_MUL,
+            GGML_OP_RESHAPE,
+            GGML_OP_UNARY,
+            GGML_OP_GATED_DELTA_NET,
+        };
+        const int cand_gdn_idx = node_idx + 9;
+        if (ggml_can_fuse_subgraph(cgraph, node_idx, 10, full_ops, &cand_gdn_idx, 1)) {
+            add_node  = cgraph->nodes[node_idx + 4];
+            sp_node   = cgraph->nodes[node_idx + 5];
+            mul_node  = cgraph->nodes[node_idx + 6];
+            resh_node = cgraph->nodes[node_idx + 7];
+            sig_node  = cgraph->nodes[node_idx + 8];
+            gdn       = cgraph->nodes[node_idx + 9];
+
+            if (ggml_get_unary_op(sp_node) == GGML_UNARY_OP_SOFTPLUS &&
+                ggml_get_unary_op(sig_node) == GGML_UNARY_OP_SIGMOID &&
+                sp_node->src[0] == add_node &&
+                resh_node->src[0] == mul_node &&
+                gdn->src[0] == q_scl &&
+                gdn->src[1] == k_scl &&
+                gdn->src[3] == resh_node &&
+                gdn->src[4] == sig_node) {
+                raw_alpha = add_node->src[0];
+                dt_bias   = add_node->src[1];
+                ssm_a     = (mul_node->src[0] == sp_node) ? mul_node->src[1]
+                          : (mul_node->src[1] == sp_node) ? mul_node->src[0]
+                          : nullptr;
+                raw_beta  = sig_node->src[0];
+                if (raw_alpha && dt_bias && ssm_a && raw_beta) {
+                    full_prologue = true;
+                    gdn_idx       = cand_gdn_idx;
+                }
+            }
+        }
+    }
+
+    if (!full_prologue && cgraph->nodes[node_idx + 4]->op == GGML_OP_GATED_DELTA_NET) {
+        static const ggml_op qk_ops[5] = {
+            GGML_OP_RMS_NORM,
+            GGML_OP_SCALE,
+            GGML_OP_RMS_NORM,
+            GGML_OP_SCALE,
+            GGML_OP_GATED_DELTA_NET,
+        };
+        const int cand_gdn_idx = node_idx + 4;
+        if (ggml_can_fuse_subgraph(cgraph, node_idx, 5, qk_ops, &cand_gdn_idx, 1)) {
+            gdn = cgraph->nodes[cand_gdn_idx];
+            if (gdn->src[0] == q_scl && gdn->src[1] == k_scl) {
+                gdn_idx = cand_gdn_idx;
+            }
+        }
+    }
+
+    if (gdn_idx < 0 || !gdn || gdn->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_tensor * src_v    = gdn->src[2];
+    const ggml_tensor * src_g    = gdn->src[3];
+    const ggml_tensor * src_beta = gdn->src[4];
+    const int64_t       S_v      = src_v->ne[0];
+    const int64_t       H        = src_v->ne[1];
+    const int64_t       n_tokens = src_v->ne[2];
+    const int64_t       n_seqs   = src_v->ne[3];
+
+    // KDA has per-channel gate [S_v, H, n_tokens, n_seqs]; prologue fusion targets standard GDN [1, H, n_tokens, n_seqs]
+    if (src_g->ne[0] != 1) {
+        return false;
+    }
+    if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
+        return false;
+    }
+    if (raw_q->ne[0] != S_v || raw_k->ne[0] != S_v) {
+        return false;
+    }
+
+    // Do not fuse prologue when the architecture's MMA chunked prefill kernel would be selected
+    if (ggml_cuda_gdn_mma_supported(ggml_cuda_get_device(), gdn)) {
+        return false;
+    }
+
+    if (full_prologue) {
+        if (raw_alpha->type != GGML_TYPE_F32 || dt_bias->type != GGML_TYPE_F32 ||
+            ssm_a->type != GGML_TYPE_F32 || raw_beta->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(raw_alpha) || !ggml_is_contiguous(dt_bias) ||
+            !ggml_is_contiguous(ssm_a) || !ggml_is_contiguous(raw_beta)) {
+            return false;
+        }
+        if (ggml_nelements(dt_bias) != H || dt_bias->ne[0] != H ||
+            ggml_nelements(ssm_a) != H || ssm_a->ne[0] != H) {
+            return false;
+        }
+        const bool valid_alpha_shape =
+            (raw_alpha->ne[0] == H || (raw_alpha->ne[0] == 1 && raw_alpha->ne[1] == H)) &&
+            ggml_nelements(raw_alpha) == H * n_tokens * n_seqs;
+        if (!valid_alpha_shape ||
+            ggml_nelements(raw_beta) != H * n_tokens * n_seqs ||
+            !ggml_are_same_shape(raw_beta, src_beta)) {
+            return false;
+        }
+    }
+
+    if (check_mem_ranges) {
+        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, gdn_idx - node_idx + 1, &gdn_idx, 1)) {
+            return false;
+        }
+        auto overlaps_gdn = [&](const ggml_tensor * t) {
+            if (!t) {
+                return false;
+            }
+            const ggml_tensor * base = t->view_src ? t->view_src : t;
+            if (!base->data || !base->buffer || !gdn->data || !gdn->buffer) {
+                return false;
+            }
+            const int64_t a_start = (int64_t) gdn->data;
+            const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(gdn->buffer->buft, gdn);
+            const int64_t b_start = (int64_t) base->data;
+            const int64_t b_end   = b_start + ggml_backend_buft_get_alloc_size(base->buffer->buft, base);
+            return (b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end);
+        };
+        if (overlaps_gdn(raw_q) || overlaps_gdn(raw_k) || overlaps_gdn(raw_alpha) || overlaps_gdn(raw_beta)) {
+            return false;
+        }
+    }
+
+    args.fuse_qk_norm = true;
+    args.q_eps        = q_eps;
+    args.q_scale      = q_scale;
+    args.k_eps        = k_eps;
+    args.k_scale      = k_scale;
+    args.raw_q        = raw_q;
+    args.raw_k        = raw_k;
+
+    if (full_prologue) {
+        args.fuse_beta_sigmoid = true;
+        args.raw_beta          = raw_beta;
+        args.fuse_gate         = true;
+        args.raw_alpha         = raw_alpha;
+        args.dt_bias           = dt_bias;
+        args.ssm_a             = ssm_a;
+    }
+
+    return true;
+}
+
 // match ssm_scan + the strided cpy that scatters its state snapshots into the cache, so the kernel writes them and skips the cpy
 static int ggml_cuda_try_ssm_scan_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_state_cpy) {
@@ -3183,7 +3410,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3596,7 +3823,46 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         if (other->type != unary->type) {
             return false;
         }
-        if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0]) || !ggml_are_same_shape(other, unary)) {
+        const bool same_shape = ggml_is_contiguous_1(other) && ggml_is_contiguous_1(unary->src[0]) && ggml_are_same_shape(other, unary);
+        const bool bcast_1d   = ggml_is_contiguous(other) && ggml_is_contiguous(unary->src[0]) && other->ne[0] == unary->ne[0] && ggml_nrows(other) == 1;
+        if (!same_shape && !bcast_1d) {
+            return false;
+        }
+
+        return true;
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_MUL
+     && unary_ops.size() == 1 && (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID || unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS)) {
+        const ggml_tensor * add   = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 2];
+
+        if (ggml_get_unary_op(unary) != unary_ops.begin()[0]) {
+            return false;
+        }
+        if (unary->src[0] != add) {
+            return false;
+        }
+        if (add->type != GGML_TYPE_F32 && add->type != GGML_TYPE_F16 && add->type != GGML_TYPE_BF16) {
+            return false;
+        }
+        if (unary->type != add->type || mul->type != add->type) {
+            return false;
+        }
+
+        const ggml_tensor * x = add->src[0];
+        const ggml_tensor * b = add->src[1];
+        const ggml_tensor * g = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+        if (x->type != add->type || b->type != add->type || g->type != add->type) {
+            return false;
+        }
+        if (!ggml_is_contiguous(x) || !ggml_is_contiguous(b) || !ggml_is_contiguous(g)) {
+            return false;
+        }
+        const bool b_ok = ggml_are_same_shape(x, b) || (b->ne[0] == x->ne[0] && ggml_nrows(b) == 1);
+        const bool g_ok = ggml_are_same_shape(unary, g) || (g->ne[0] == unary->ne[0] && ggml_nrows(g) == 1);
+        if (!b_ok || !g_ok) {
             return false;
         }
 
@@ -3691,6 +3957,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+        }
+    }
+
+    // rms_norm + scale (q/k) + [add + softplus + mul + reshape (gate) + sigmoid (beta)] + gated_delta_net [+ cpy]
+    if (node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_gated_delta_net_fusion_args gdn_args;
+        int                                   gdn_idx = -1;
+        if (ggml_cuda_try_gdn_prologue_fusion(cgraph, i, gdn_args, gdn_idx, /*check_mem_ranges=*/true)) {
+            const int cache_skip      = ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, gdn_args.cache);
+            gdn_args.has_cache_fusion = (cache_skip > 0);
+            ggml_cuda_op_gated_delta_net_fused(*cuda_ctx, cgraph->nodes[gdn_idx], gdn_args);
+            return (gdn_idx - i) + cache_skip;
         }
     }
 
@@ -4426,6 +4704,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+        ggml_cuda_op_add_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
@@ -4821,6 +5106,25 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
                 }
                 i += match.node_count - 1;
+            }
+
+            if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM) {
+                ggml_cuda_gated_delta_net_fusion_args gdn_args;
+                int                                   gdn_idx = -1;
+                if (ggml_cuda_try_gdn_prologue_fusion(cgraph, i, gdn_args, gdn_idx, /*check_mem_ranges=*/false)) {
+                    add_alloc_deps(i, gdn_idx);
+                    // q_conv and k_conv are views of conv_output_silu; keep their underlying view_src alive until GDN
+                    for (int k = i; k < gdn_idx; ++k) {
+                        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                            ggml_tensor * s = cgraph->nodes[k]->src[j];
+                            if (s && s->view_src) {
+                                params->add_alloc_dep(params->user_data, s->view_src, cgraph->nodes[gdn_idx]);
+                            }
+                        }
+                    }
+                    i = gdn_idx;
+                    continue;
+                }
             }
 
             if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
