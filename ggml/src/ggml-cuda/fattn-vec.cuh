@@ -433,32 +433,66 @@ static __global__ void flash_attn_ext_vec(
     }
 
     if (sinks && blockIdx.y == 0) {
+        // ncols2 == 1 keeps the original loop so non-RDNA4 device code stays unchanged.
+        if constexpr (ncols2 == 1) {
+            const float sink = ((const float *) sinks)[head0];
+
 #pragma unroll
-        for (int j = 0; j < ncols; ++j) {
-            if (threadIdx.y != j % nwarps) { // Compile-time j keeps KQ_max / KQ_sum / VKQ statically indexed.
-                continue;
-            }
-            const float sink = ((const float *) sinks)[head0 + j % ncols2];
+            for (int j0 = 0; j0 < ncols; j0 += nwarps) {
+                const int j = j0 + threadIdx.y;
 
-            const float kqmax_new_j = fmaxf(sink, KQ_max[j]);
-            const float KQ_max_scale = expf(KQ_max[j] - kqmax_new_j);
-            KQ_max[j] = kqmax_new_j;
+                if (j0 + nwarps > ncols && j >= ncols) {
+                    break;
+                }
 
-            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + (threadIdx.x == 0 ? expf(sink - KQ_max[j]) : 0.0f);
+                const float kqmax_new_j = fmaxf(sink, KQ_max[j]);
+                const float KQ_max_scale = expf(KQ_max[j] - kqmax_new_j);
+                KQ_max[j] = kqmax_new_j;
+
+                KQ_sum[j] = KQ_sum[j]*KQ_max_scale + (threadIdx.x == 0 ? expf(sink - KQ_max[j]) : 0.0f);
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
 #pragma unroll
-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-                VKQ[j][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
-            }
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
+                    VKQ[j][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
+                }
 #else
 #pragma unroll
-            for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
-                VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
-                VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
-            }
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
+                    VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
+                    VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
+                }
 #endif // V_DOT2_F32_F16_AVAILABLE
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (threadIdx.y != j % nwarps) { // Compile-time j keeps KQ_max / KQ_sum / VKQ statically indexed.
+                    continue;
+                }
+                const float sink = ((const float *) sinks)[head0 + j % ncols2];
+
+                const float kqmax_new_j = fmaxf(sink, KQ_max[j]);
+                const float KQ_max_scale = expf(KQ_max[j] - kqmax_new_j);
+                KQ_max[j] = kqmax_new_j;
+
+                KQ_sum[j] = KQ_sum[j]*KQ_max_scale + (threadIdx.x == 0 ? expf(sink - KQ_max[j]) : 0.0f);
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+#pragma unroll
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
+                    VKQ[j][i_VKQ_0/nthreads_V] *= KQ_max_scale_h2;
+                }
+#else
+#pragma unroll
+                for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V) {
+                    VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
+                    VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
+                }
+#endif // V_DOT2_F32_F16_AVAILABLE
+            }
         }
     }
 
@@ -562,8 +596,11 @@ static __global__ void flash_attn_ext_vec(
 
     }
 
-    if (gridDim.y != 1) {
-        // Compile-time j, as for the sinks above.
+    if constexpr (ncols2 == 1) {
+        if (gridDim.y != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z))) {
+            dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head0)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
+        }
+    } else if (gridDim.y != 1) {
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
             if (tid == j && (ncols1 == 1 || ic0 + j/ncols2 < int(ne01.z))) {
