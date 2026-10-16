@@ -338,8 +338,10 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], n_seq_tokens, n_seqs);
 
             // Get SSM state and compute KDA recurrence using ggml_kda_scan
+            // Zero-copy view into ssm_states_all when slots are contiguous: build_delta_net is the sole
+            // reader and precedes the state cpy writer below.
             ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
-            ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
+            ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs, nullptr, /*zero_copy=*/ true);
             state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
 
 

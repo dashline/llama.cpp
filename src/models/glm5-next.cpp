@@ -855,8 +855,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "kda_beta", il);
 
+    // Zero-copy view into ssm_states_all when slots are contiguous: GDN is the sole reader and
+    // directly precedes the state snapshot write in build_recurrent_attn.
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
-    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs, nullptr, /*zero_copy=*/ true);
     state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
 
     // Match FLA l2 norm
