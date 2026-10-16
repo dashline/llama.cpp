@@ -35,7 +35,7 @@ public:
         // data for ggml_set_rows
         using idx_vec_t = std::vector<uint32_t>;
 
-        // number of streams: ns = s1 - s0 + 1
+        // min/max stream bounds in the ubatch; number of active streams is n_stream() == strm.size()
         uint32_t s0;
         uint32_t s1;
 
