@@ -11296,6 +11296,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Routed-compact MoE MMQ coverage (n_mats >= 8, m >= 128, n > 8) for all compact K/Q quants.
+    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n_used : {2, 4}) {
+            for (bool b : {false, true}) {
+                for (int n : {9, 16, 33, 64, 129}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, n_used, b, 256, n, 256));
+                }
+            }
+        }
+    }
+
     for (int bs : {1, 4, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
@@ -12153,6 +12164,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
             false, 16, 8, false, false, true, false, { 1, 1 }));
+    }
+
+    // Routed-compact MoE MMQ fused up+gate+GLU coverage (n_mats >= 8, n % 128 == 0, m > 8, no bias).
+    for (ggml_type type : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_REGLU}) {
+            for (int n_used : {2, 4}) {
+                for (bool b : {false, true}) {
+                    for (int64_t n_rows : {128, 256}) {
+                        for (int64_t m_batch : {8, 9, 16, 33, 64, 129}) {
+                            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, n_rows, 256,
+                                true, 8, n_used, b, false, true, false, {1, 1}));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
