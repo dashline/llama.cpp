@@ -4726,6 +4726,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (int skip = ggml_cuda_gdn_conv_try_fuse(cuda_ctx, cgraph, i)) {
+        return skip;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -5144,6 +5148,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
                 }
                 i += match.node_count - 1;
+            }
+
+            if (cgraph->nodes[i]->op == GGML_OP_CONCAT) {
+                ggml_cuda_gdn_conv_match gm;
+                if (ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.x), gm.conv_out);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.state), gm.conv_out);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.w), gm.conv_out);
+                    params->add_alloc_dep(params->user_data, gm.concat, gm.conv_out);
+                    params->add_alloc_dep(params->user_data, cgraph->nodes[gm.conv_idx], gm.conv_out);
+                }
             }
 
             if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM) {
