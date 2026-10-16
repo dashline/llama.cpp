@@ -84,6 +84,85 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     return data;
 }
 
+static constexpr int GGML_CUDA_FA_Q8_CHUNK = 8;
+
+static inline bool ggml_cuda_fattn_kv_layout_ok(const ggml_tensor * t, const ggml_type type) {
+    return t != nullptr && t->type == type &&
+        t->ne[0] % ggml_blck_size(type) == 0 &&
+        t->nb[0] == (size_t) ggml_type_size(type);
+}
+
+enum fattn_kv_native_type : int {
+    FATTN_KV_NATIVE_NONE = 0,
+    FATTN_KV_NATIVE_Q8_0 = 1,
+    FATTN_KV_NATIVE_Q4_0 = 2,
+};
+
+static constexpr int FATTN_KV_NATIVE_PER_OPERAND = -1;
+
+static inline int ggml_cuda_fattn_kv_native_type(const ggml_tensor * t) {
+#ifdef FAST_FP16_AVAILABLE
+    if (t == nullptr) {
+        return FATTN_KV_NATIVE_NONE;
+    }
+    if (ggml_cuda_fattn_kv_layout_ok(t, GGML_TYPE_Q8_0)) { return FATTN_KV_NATIVE_Q8_0; }
+    if (ggml_cuda_fattn_kv_layout_ok(t, GGML_TYPE_Q4_0)) { return FATTN_KV_NATIVE_Q4_0; }
+#else
+    GGML_UNUSED(t);
+#endif
+    return FATTN_KV_NATIVE_NONE;
+}
+
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q8_0_chunk(
+        const char * const __restrict__ row, const int el, half2 * const __restrict__ dst) {
+    static_assert(sizeof(block_q8_0) == QK8_0 + 2, "bad block_q8_0");
+
+    const int blk = el / QK8_0;
+    const int off = el % QK8_0;
+    const char * bp = row + (size_t) blk*sizeof(block_q8_0);
+
+    half d;
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&d, bp);
+    const half2 d2 = __half2half2(d);
+
+    int8_t q[GGML_CUDA_FA_Q8_CHUNK];
+    ggml_cuda_memcpy_1<GGML_CUDA_FA_Q8_CHUNK, 2>(q, bp + sizeof(half) + off);
+
+#pragma unroll
+    for (int l = 0; l < GGML_CUDA_FA_Q8_CHUNK/2; ++l) {
+        dst[l] = d2 * make_half2(q[2*l + 0], q[2*l + 1]);
+    }
+}
+
+static __device__ __forceinline__ void ggml_cuda_fattn_dequantize_q4_0_chunk(
+        const char * const __restrict__ row, const int el, half2 * const __restrict__ dst) {
+    static_assert(sizeof(block_q4_0) == QK4_0/2 + 2, "bad block_q4_0");
+
+    const int blk = el / QK4_0;
+    const int off = el % QK4_0;
+    const char * bp = row + (size_t) blk*sizeof(block_q4_0);
+
+    half d_h;
+    ggml_cuda_memcpy_1<sizeof(half), 2>(&d_h, bp);
+    const half2 d2 = __half2half2(d_h);
+
+    const int lo   = off < QK4_0/2;
+    const int base = lo ? off : off - QK4_0/2;
+    int q[2];
+    ggml_cuda_memcpy_1<8, 2>(q, bp + sizeof(half) + base);
+    const int shift = lo ? 0 : 4;
+#pragma unroll
+    for (int w = 0; w < 2; ++w) {
+        q[w] = __vsub4((q[w] >> shift) & 0x0F0F0F0F, 0x08080808);
+    }
+    const int8_t * q8 = (const int8_t *) q;
+
+#pragma unroll
+    for (int l = 0; l < GGML_CUDA_FA_Q8_CHUNK/2; ++l) {
+        dst[l] = d2 * make_half2(q8[2*l + 0], q8[2*l + 1]);
+    }
+}
+
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
@@ -1019,7 +1098,8 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false, const int kv_native_kernel = FATTN_KV_NATIVE_NONE,
+    const bool mma_kv_native_args = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1049,8 +1129,22 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    const int  kv_native_K  = !need_f16_K ? FATTN_KV_NATIVE_NONE :
+        (kv_native_kernel != FATTN_KV_NATIVE_PER_OPERAND ? kv_native_kernel : ggml_cuda_fattn_kv_native_type(K));
+    const int  kv_native_V  = !need_f16_V ? FATTN_KV_NATIVE_NONE :
+        (kv_native_kernel != FATTN_KV_NATIVE_PER_OPERAND ? kv_native_kernel :
+         (V_is_K_view ? kv_native_K : ggml_cuda_fattn_kv_native_type(V)));
+
+    const bool use_native_K = kv_native_K != FATTN_KV_NATIVE_NONE;
+    const bool use_native_V = kv_native_V != FATTN_KV_NATIVE_NONE;
+
+    const int kv_native_kernel_K = use_native_K ? kv_native_K : FATTN_KV_NATIVE_NONE;
+    const int kv_native_kernel_V = use_native_V ? kv_native_V : FATTN_KV_NATIVE_NONE;
+
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV,
+            need_f16_K && !use_native_K,
+            need_f16_V && !use_native_V);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1066,7 +1160,7 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (need_f16_K && K->type != GGML_TYPE_F16 && !use_native_K) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1094,7 +1188,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && V->type != GGML_TYPE_F16 && !use_native_V) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1285,6 +1379,9 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    const int32_t ne00_arg = mma_kv_native_args ? kv_native_kernel_K : Q->ne[0];
+    const int32_t ne10_arg = mma_kv_native_args ? kv_native_kernel_V : K->ne[0];
+
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
@@ -1295,8 +1392,8 @@ void launch_fattn(
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-        Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
+        ne00_arg, ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+        ne10_arg, n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
