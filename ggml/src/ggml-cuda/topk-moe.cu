@@ -13,6 +13,140 @@ struct topk_moe_config {
     bool delayed_softmax;
 };
 
+template <int mask>
+__device__ __forceinline__ int topk_moe_xor(const int x) {
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
+    static_assert(mask == 16 || mask == 8 || mask == 4 || mask == 2 || mask == 1, "unsupported mask");
+    if constexpr (mask == 16) {
+        return (int) __builtin_amdgcn_permlanex16(0u, (unsigned int) x, 0x76543210u, 0xfedcba98u, false, false);
+    } else {
+        return __builtin_amdgcn_update_dpp(0, x, 0x160 | mask, 0xF, 0xF, false);
+    }
+#else
+    return __shfl_xor_sync(0xFFFFFFFF, x, mask, WARP_SIZE);
+#endif
+}
+
+template <int mask>
+__device__ __forceinline__ uint32_t topk_moe_xor(const uint32_t x) {
+    return (uint32_t) topk_moe_xor<mask>((int) x);
+}
+
+template <int mask>
+__device__ __forceinline__ float topk_moe_xor(const float x) {
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4))
+    return __uint_as_float(topk_moe_xor<mask>(__float_as_uint(x)));
+#else
+    return __shfl_xor_sync(0xFFFFFFFF, x, mask, WARP_SIZE);
+#endif
+}
+
+__device__ __forceinline__ float topk_moe_warp_reduce_max(float x) {
+    x = max(x, topk_moe_xor<16>(x));
+    x = max(x, topk_moe_xor<8>(x));
+    x = max(x, topk_moe_xor<4>(x));
+    x = max(x, topk_moe_xor<2>(x));
+    x = max(x, topk_moe_xor<1>(x));
+    return x;
+}
+
+__device__ __forceinline__ float topk_moe_warp_reduce_sum(float x) {
+    x += topk_moe_xor<16>(x);
+    x += topk_moe_xor<8>(x);
+    x += topk_moe_xor<4>(x);
+    x += topk_moe_xor<2>(x);
+    x += topk_moe_xor<1>(x);
+    return x;
+}
+
+template <int mask>
+__device__ __forceinline__ void topk_moe_argmax_stage(float & max_val, int & max_expert) {
+    const float val    = topk_moe_xor<mask>(max_val);
+    const int   expert = topk_moe_xor<mask>(max_expert);
+    if (val > max_val || (val == max_val && expert < max_expert)) {
+        max_val    = val;
+        max_expert = expert;
+    }
+}
+
+template <int mask>
+__device__ __forceinline__ void topk_moe_argmax_stage_bias(float & max_val, float & max_val_s, int & max_expert) {
+    const float val    = topk_moe_xor<mask>(max_val);
+    const float val_s  = topk_moe_xor<mask>(max_val_s);
+    const int   expert = topk_moe_xor<mask>(max_expert);
+    if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
+        max_val    = val;
+        max_val_s  = val_s;
+        max_expert = expert;
+    }
+}
+
+__device__ __forceinline__ uint64_t topk_moe_pack_key(const float val, const int expert) {
+    const float    v      = (val == 0.0f) ? 0.0f : val;
+    const uint32_t bits   = __float_as_uint(v);
+    const uint32_t key_hi = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+    const uint32_t key_lo = uint32_t((WARP_SIZE * 512 - 1) - expert);
+    return (uint64_t(key_hi) << 32) | key_lo;
+}
+
+__device__ __forceinline__ float topk_moe_unpack_val(const uint64_t key) {
+    const uint32_t key_hi = uint32_t(key >> 32);
+    const uint32_t bits   = (key_hi & 0x80000000u) ? (key_hi ^ 0x80000000u) : ~key_hi;
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ int topk_moe_unpack_expert(const uint64_t key) {
+    return (WARP_SIZE * 512 - 1) - int(uint32_t(key));
+}
+
+template <int mask>
+__device__ __forceinline__ void topk_moe_key_max_stage(uint64_t & best_key) {
+    const uint32_t hi        = topk_moe_xor<mask>(uint32_t(best_key >> 32));
+    const uint32_t lo        = topk_moe_xor<mask>(uint32_t(best_key));
+    const uint64_t other_key = (uint64_t(hi) << 32) | lo;
+    if (other_key > best_key) {
+        best_key = other_key;
+    }
+}
+
+__device__ __forceinline__ void topk_moe_compare_swap_desc(uint64_t & a, uint64_t & b) {
+    if (b > a) {
+        const uint64_t tmp = a;
+        a                  = b;
+        b                  = tmp;
+    }
+}
+
+__device__ __forceinline__ void topk_moe_compare_swap_asc(uint64_t & a, uint64_t & b) {
+    if (a > b) {
+        const uint64_t tmp = a;
+        a                  = b;
+        b                  = tmp;
+    }
+}
+
+template <int N>
+__device__ __forceinline__ void topk_moe_sort_keys(uint64_t (&keys)[N]) {
+    static_assert((N & (N - 1)) == 0, "N must be a power of two");
+#pragma unroll
+    for (int k = 2; k <= N; k <<= 1) {
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+#pragma unroll
+            for (int i = 0; i < N; ++i) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    if ((i & k) == 0) {
+                        topk_moe_compare_swap_desc(keys[i], keys[ixj]);
+                    } else {
+                        topk_moe_compare_swap_asc(keys[i], keys[ixj]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
@@ -27,7 +161,7 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         }
     }
 
-    max_val = warp_reduce_max(max_val);
+    max_val = topk_moe_warp_reduce_max(max_val);
 
     float sum = 0.f;
 
@@ -44,7 +178,7 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         }
     }
 
-    sum = warp_reduce_sum(sum);
+    sum = topk_moe_warp_reduce_sum(sum);
 
     const float inv_sum = 1.0f / sum;
 
@@ -185,77 +319,110 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 
     ggml_cuda_pdl_lc();
-    for (int k = 0; k < n_expert_used; k++) {
-        float max_val    = wt[0];
-        int   max_expert = threadIdx.x;
+    constexpr bool use_sorted_keys =
+        !has_bias && experts_per_thread >= 2 && (n_experts % WARP_SIZE == 0) && ((experts_per_thread & (experts_per_thread - 1)) == 0);
 
-        if constexpr (has_bias) {
-            float max_val_s = selection_wt[0];
-
+    if constexpr (use_sorted_keys) {
+        uint64_t keys[experts_per_thread];
 #pragma unroll
-            for (int i = 1; i < experts_per_thread; i++) {
-                const int expert = threadIdx.x + i * WARP_SIZE;
-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && selection_wt[i] > max_val_s) {
-                    max_val    = wt[i];
-                    max_val_s  = selection_wt[i];
-                    max_expert = expert;
-                }
+        for (int i = 0; i < experts_per_thread; i++) {
+            const int expert = threadIdx.x + i * WARP_SIZE;
+            keys[i]          = topk_moe_pack_key(wt[i], expert);
+        }
+
+        topk_moe_sort_keys(keys);
+        int head = 0;
+
+        for (int k = 0; k < n_expert_used; k++) {
+            uint64_t best_key = (head < experts_per_thread) ? keys[head] : 0ULL;
+
+            topk_moe_key_max_stage<16>(best_key);
+            topk_moe_key_max_stage<8>(best_key);
+            topk_moe_key_max_stage<4>(best_key);
+            topk_moe_key_max_stage<2>(best_key);
+            topk_moe_key_max_stage<1>(best_key);
+
+            const float max_val    = topk_moe_unpack_val(best_key);
+            const int   max_expert = topk_moe_unpack_expert(best_key);
+
+            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+                head++;
             }
 
-#pragma unroll
-            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const float val_s  = __shfl_xor_sync(0xFFFFFFFF, max_val_s, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
-                if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
-                    max_val    = val;
-                    max_val_s  = val_s;
-                    max_expert = expert;
-                }
+            if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
+                output_weights[k / WARP_SIZE] = max_val;
             }
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                selection_wt[max_expert / WARP_SIZE] = -INFINITY;
+                ids[k] = max_expert;
+                if (config.with_norm) {
+                    wt_sum += max_val;
+                }
             }
-        } else {
+        }
+    } else {
+        for (int k = 0; k < n_expert_used; k++) {
+            float max_val    = wt[0];
+            int   max_expert = threadIdx.x;
+
+            if constexpr (has_bias) {
+                float max_val_s = selection_wt[0];
+
 #pragma unroll
-            for (int i = 1; i < experts_per_thread; i++) {
-                const int expert = threadIdx.x + i * WARP_SIZE;
-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
-                    max_val    = wt[i];
-                    max_expert = expert;
+                for (int i = 1; i < experts_per_thread; i++) {
+                    const int expert = threadIdx.x + i * WARP_SIZE;
+                    if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && selection_wt[i] > max_val_s) {
+                        max_val    = wt[i];
+                        max_val_s  = selection_wt[i];
+                        max_expert = expert;
+                    }
+                }
+
+                topk_moe_argmax_stage_bias<16>(max_val, max_val_s, max_expert);
+                topk_moe_argmax_stage_bias<8>(max_val, max_val_s, max_expert);
+                topk_moe_argmax_stage_bias<4>(max_val, max_val_s, max_expert);
+                topk_moe_argmax_stage_bias<2>(max_val, max_val_s, max_expert);
+                topk_moe_argmax_stage_bias<1>(max_val, max_val_s, max_expert);
+
+                if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+                    selection_wt[max_expert / WARP_SIZE] = -INFINITY;
+                }
+            } else {
+#pragma unroll
+                for (int i = 1; i < experts_per_thread; i++) {
+                    const int expert = threadIdx.x + i * WARP_SIZE;
+                    if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
+                        max_val    = wt[i];
+                        max_expert = expert;
+                    }
+                }
+
+                topk_moe_argmax_stage<16>(max_val, max_expert);
+                topk_moe_argmax_stage<8>(max_val, max_expert);
+                topk_moe_argmax_stage<4>(max_val, max_expert);
+                topk_moe_argmax_stage<2>(max_val, max_expert);
+                topk_moe_argmax_stage<1>(max_val, max_expert);
+
+                if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+                    wt[max_expert / WARP_SIZE] = -INFINITY;
                 }
             }
 
-#pragma unroll
-            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
-                if (val > max_val || (val == max_val && expert < max_expert)) {
-                    max_val    = val;
-                    max_expert = expert;
-                }
+            if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
+                output_weights[k / WARP_SIZE] = max_val;
             }
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                wt[max_expert / WARP_SIZE] = -INFINITY;
-            }
-        }
-
-        if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
-            output_weights[k / WARP_SIZE] = max_val;
-        }
-
-        if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-            ids[k] = max_expert;
-            if (config.with_norm) {
-                wt_sum += max_val;
+                ids[k] = max_expert;
+                if (config.with_norm) {
+                    wt_sum += max_val;
+                }
             }
         }
     }
 
     if (config.with_norm) {
-        wt_sum              = warp_reduce_sum(wt_sum);
+        wt_sum              = topk_moe_warp_reduce_sum(wt_sum);
         wt_sum              = max(wt_sum, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
 
