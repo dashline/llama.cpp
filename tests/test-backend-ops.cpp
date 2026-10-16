@@ -4018,6 +4018,117 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL (+ optional Q4_K MUL_MAT consumer for q8_1 cache)
+struct test_add_rms_norm_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool keep_residual;
+    const bool with_mmvq;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return with_mmvq ? 1e-3 : 1e-6;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, eps, keep_residual, with_mmvq);
+    }
+
+    test_add_rms_norm_mul(std::array<int64_t, 4> ne = {512, 4, 1, 1},
+            float eps = 1e-6f, bool keep_residual = true, bool with_mmvq = false)
+        : ne(ne), eps(eps), keep_residual(keep_residual), with_mmvq(with_mmvq) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * add_res = ggml_add(ctx, a, b);
+        ggml_tensor * norm    = ggml_rms_norm(ctx, add_res, eps);
+        ggml_tensor * mul_res = ggml_mul(ctx, norm, w);
+
+        ggml_tensor * out = mul_res;
+        if (with_mmvq) {
+            ggml_tensor * mat = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, ne[0], ne[0]);
+            ggml_set_name(mat, "mat");
+            out = ggml_mul_mat(ctx, mat, mul_res);
+        }
+        if (keep_residual) {
+            out = ggml_add(ctx, out, add_res);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_RMS_NORM + GGML_OP_MUL + (optional RESHAPE) + GGML_OP_UNARY(SILU/SIGMOID) + GGML_OP_MUL
+struct test_rms_norm_gated : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool is_sigmoid;
+    const bool with_reshape;
+    const bool with_mmvq;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_GATED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return with_mmvq ? 1e-3 : 1e-6;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, eps, is_sigmoid, with_reshape, with_mmvq);
+    }
+
+    test_rms_norm_gated(std::array<int64_t, 4> ne = {128, 4, 4, 1},
+            float eps = 1e-6f, bool is_sigmoid = false, bool with_reshape = true, bool with_mmvq = false)
+        : ne(ne), eps(eps), is_sigmoid(is_sigmoid), with_reshape(with_reshape), with_mmvq(with_mmvq) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0] * ne[1], ne[2], ne[3]);
+        ggml_set_name(x, "x");
+        ggml_set_name(w, "w");
+        ggml_set_name(z, "z");
+
+        ggml_tensor * norm = ggml_rms_norm(ctx, x, eps);
+        ggml_tensor * mul1 = ggml_mul(ctx, norm, w);
+        ggml_tensor * gate = with_reshape
+            ? ggml_reshape_4d(ctx, z, ne[0], ne[1], ne[2], ne[3])
+            : ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        if (!with_reshape) {
+            ggml_set_name(gate, "gate");
+        }
+        ggml_tensor * act  = is_sigmoid ? ggml_sigmoid(ctx, gate) : ggml_silu(ctx, gate);
+        ggml_tensor * mul2 = ggml_mul(ctx, mul1, act);
+
+        ggml_tensor * out = mul2;
+        if (with_mmvq) {
+            const int64_t flat = ne[0] * ne[1];
+            ggml_tensor * reshaped = ggml_reshape_2d(ctx, mul2, flat, ne[2] * ne[3]);
+            ggml_tensor * mat      = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, flat, 64);
+            ggml_set_name(mat, "mat");
+            out = ggml_mul_mat(ctx, mat, reshaped);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -10588,6 +10699,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
 
+    for (int64_t n_tokens : { 1, 4, 8 }) {
+        test_cases.emplace_back(new test_add_rms_norm_mul({ 512, n_tokens, 1, 1 }, 1e-6f, true, false));
+        test_cases.emplace_back(new test_add_rms_norm_mul({ 512, n_tokens, 1, 1 }, 1e-6f, true, true));
+        test_cases.emplace_back(new test_rms_norm_gated({ 128, 4, n_tokens, 1 }, 1e-6f, false, true, false));
+        test_cases.emplace_back(new test_rms_norm_gated({ 128, 4, n_tokens, 1 }, 1e-6f, false, true, true));
+        test_cases.emplace_back(new test_rms_norm_gated({ 128, 4, n_tokens, 1 }, 1e-6f, true, false, false));
+    }
+
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
 
@@ -11137,6 +11256,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : {16, 32, 64}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 4, false, 4096, n, 2048, 1e5f));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,   2, false, 512,  n, 256,  1e5f));
+    }
+
+    // test multi-warp MoE MMVQ (nwarps_per_token = 2/4 and n = 2..8)
+    for (int n : {2, 3, 4, 6, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 8, 2, false, 256, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q4_K, GGML_TYPE_F32, 8, 2, false, 256, n, 2048, 1, true));
     }
 
     for (ggml_type type_a : base_types) {
