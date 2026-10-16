@@ -363,6 +363,9 @@ static __global__ void mul_mat_vec_f(
                 gate_value += gate_bias[tid*stride_col_dst + row];
             }
             switch (glu_op) {
+                case GGML_GLU_OP_REGLU:
+                    value *= fmaxf(gate_value, 0.0f);
+                    break;
                 case GGML_GLU_OP_SWIGLU:
                     value *= ggml_cuda_op_silu_single(gate_value);
                     break;
