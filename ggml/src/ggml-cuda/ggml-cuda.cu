@@ -755,6 +755,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             if (cublas_workspaces[i][j] != nullptr) {
                 CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
             }
+            for (int k = 0; k < MMVQ_Q8_1_CACHE_SLOTS; ++k) {
+                auto & slot = mmvq_q8_1_cache[i][j][k];
+                if (slot.ptr != nullptr && slot.pool != nullptr) {
+                    slot.pool->free(slot.ptr, slot.alloc_size);
+                    slot.ptr = nullptr;
+                    slot.alloc_size = 0;
+                }
+            }
         }
     }
 }
@@ -2140,6 +2148,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
+    ctx.invalidate_mmvq_q8_1_cache_range(src1_sorted.ptr, ne12*n_expert_used*ne10*ts_src1_sorted);
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
@@ -2157,7 +2166,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
-        src1_slice.buffer = src1->buffer;
+        src1_slice.buffer = nullptr;
         src1_slice.type   = type_src1_sorted;
         src1_slice.ne[0]  = ne10;
         src1_slice.ne[1]  = tokens_per_expert[i02];
@@ -4842,6 +4851,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            cuda_ctx->reset_mmvq_q8_1_cache();
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4887,6 +4898,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    for (int k = i; k <= i + nodes_to_skip; ++k) {
+                        cuda_ctx->invalidate_mmvq_q8_1_cache_range(cgraph->nodes[k]->data, ggml_nbytes(cgraph->nodes[k]));
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4918,6 +4932,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                cuda_ctx->invalidate_mmvq_q8_1_cache_range(node->data, ggml_nbytes(node));
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
