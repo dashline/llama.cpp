@@ -761,13 +761,16 @@ static __global__ void mul_mat_vec_q(
 #endif
 
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
+            for (int j = 0; j < ncols_dst; ++j) {
                 tmp[j][i] += vec_dot_q_cuda(
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
+            }
+            if constexpr (has_fusion) {
+                if (use_gate) {
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
@@ -1049,7 +1052,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+    if constexpr (c_ncols_dst <= 4) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, rdna4_nwarps>, launch_params,
@@ -1060,7 +1063,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst <= 4");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, rdna4_nwarps>, launch_params,
@@ -1263,6 +1266,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } break;
         case 2: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 2;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1271,6 +1275,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 3: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 3;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1279,6 +1284,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 4: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 4;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1287,6 +1293,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 5: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 5;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1295,6 +1302,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 6: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 6;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1303,6 +1311,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 7: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 7;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1311,6 +1320,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 8: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 8;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
