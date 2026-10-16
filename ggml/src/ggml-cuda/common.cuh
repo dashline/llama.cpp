@@ -1612,7 +1612,7 @@ struct ggml_backend_cuda_context {
         }
     }
 
-    void invalidate_mmvq_q8_1_cache_range(const void * data, size_t nbytes) {
+    void invalidate_mmvq_q8_1_cache_range(const void * data, size_t nbytes, const ggml_tensor * keep_tensor = nullptr) {
         if (!data || nbytes == 0) {
             return;
         }
@@ -1624,6 +1624,9 @@ struct ggml_backend_cuda_context {
                 if (!slot.src1_data || slot.src1_nbytes == 0) {
                     continue;
                 }
+                if (keep_tensor != nullptr && slot.src1_tensor == keep_tensor) {
+                    continue;
+                }
                 const uintptr_t c_begin = reinterpret_cast<uintptr_t>(slot.src1_data);
                 const uintptr_t c_end   = c_begin + slot.src1_nbytes;
                 if (w_begin < c_end && c_begin < w_end) {
@@ -1631,6 +1634,58 @@ struct ggml_backend_cuda_context {
                 }
             }
         }
+    }
+
+    block_q8_1 * alloc_mmvq_q8_1_cache_slot(
+            const ggml_tensor * src1_tensor,
+            int64_t ne10, int64_t ne10_padded,
+            int64_t ne11, int64_t ne12, int64_t ne13,
+            int64_t s11, int64_t s12, int64_t s13) {
+        if (!src1_tensor || !src1_tensor->data || !src1_tensor->buffer) {
+            return nullptr;
+        }
+        const size_t src1_nbytes = ggml_nbytes(src1_tensor);
+        invalidate_mmvq_q8_1_cache_range(src1_tensor->data, src1_nbytes, nullptr);
+
+        const size_t q8_1_nbytes = ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1;
+        auto * slots = mmvq_q8_1_cache[device][curr_stream_no];
+        uint64_t & tick = mmvq_q8_1_cache_tick[device][curr_stream_no];
+
+        int victim = 0;
+        for (int k = 0; k < MMVQ_Q8_1_CACHE_SLOTS; ++k) {
+            if (slots[k].src1_data == nullptr) {
+                victim = k;
+                break;
+            }
+            if (slots[k].last_use < slots[victim].last_use) {
+                victim = k;
+            }
+        }
+        auto & slot = slots[victim];
+        if (slot.pool == nullptr) {
+            slot.pool = new_pool_for_device(device, curr_stream_no);
+        }
+        if (slot.ptr != nullptr && slot.alloc_size < q8_1_nbytes) {
+            slot.pool->free(slot.ptr, slot.alloc_size);
+            slot.ptr = nullptr;
+            slot.alloc_size = 0;
+        }
+        if (slot.ptr == nullptr) {
+            slot.ptr = (char *) slot.pool->alloc(q8_1_nbytes, &slot.alloc_size);
+        }
+        slot.src1_tensor = src1_tensor;
+        slot.src1_data   = src1_tensor->data;
+        slot.src1_nbytes = src1_nbytes;
+        slot.ne10        = ne10;
+        slot.ne10_padded = ne10_padded;
+        slot.ne11        = ne11;
+        slot.ne12        = ne12;
+        slot.ne13        = ne13;
+        slot.s11         = s11;
+        slot.s12         = s12;
+        slot.s13         = s13;
+        slot.last_use    = ++tick;
+        return reinterpret_cast<block_q8_1 *>(slot.ptr);
     }
 };
 

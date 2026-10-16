@@ -8,6 +8,17 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
 
+void ggml_cuda_op_rms_norm_pre_add_fused(ggml_backend_cuda_context & ctx,
+                                         ggml_tensor *               add_tensor,
+                                         ggml_tensor *               rms_tensor,
+                                         ggml_tensor *               mul_tensor);
+
+void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx,
+                                 ggml_tensor *               rms_tensor,
+                                 ggml_tensor *               mul1_tensor,
+                                 ggml_tensor *               unary_tensor,
+                                 ggml_tensor *               mul2_tensor);
+
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
