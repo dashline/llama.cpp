@@ -446,8 +446,10 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
 
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx0, cur, cur->ne[0], n_seq_tokens, n_seqs);
 
+    // Zero-copy view into ssm_states_all when slots are contiguous: GDN is the sole reader and
+    // directly precedes the state snapshot write in build_recurrent_attn.
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
-    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs, nullptr, /*zero_copy=*/ true);
     state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
 
     const float eps_norm = hparams.f_norm_rms_eps;
