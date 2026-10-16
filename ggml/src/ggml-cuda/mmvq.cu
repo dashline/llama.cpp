@@ -449,7 +449,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false, int nwarps_override = 0) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -497,10 +497,21 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q6_K:
                 case GGML_TYPE_IQ4_NL:
                 case GGML_TYPE_IQ4_XS:
+                    // 8 warps cover 4096 Q4_K elements/iter. Shrink to the warps that have K.
+                    if (nwarps_override == 1 || nwarps_override == 2 || nwarps_override == 4 || nwarps_override == 8) {
+                        return nwarps_override;
+                    }
                     return 8;
                 default:
                     return 1;
             }
+        }
+        // ncols_dst 2..8 was 1 warp. A wider block is faster on RDNA4 decode.
+        if (ncols_dst <= 4) {
+            return 4;
+        }
+        if (ncols_dst <= 8) {
+            return 2;
         }
         return 1;
     }
@@ -577,7 +588,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 || table_id == MMVQ_PARAMETERS_RDNA4) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -596,8 +607,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rdna4_nwarps = 0>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters, rdna4_nwarps)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -614,7 +625,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
-    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+    constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters, rdna4_nwarps);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -1016,8 +1027,8 @@ static __global__ void mul_mat_vec_q_moe(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
-    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false, const int nwarps_override = 0) {
+    const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters, nwarps_override);
     const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
@@ -1026,7 +1037,7 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rdna4_nwarps = 0>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1041,7 +1052,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, rdna4_nwarps>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1052,7 +1063,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, rdna4_nwarps>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1216,7 +1227,34 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
-            if (should_use_small_k(c_ncols_dst)) {
+            // RDNA4 c=1: nwarps from K. 1 warp covers blocks_per_iter_1warp superblocks.
+            const auto launch_k = [&](auto nwarps_tag) {
+                constexpr int k_nwarps = decltype(nwarps_tag)::value;
+                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst + (fusion.shared_up != nullptr),
+                                                                              nsamples_dst, warp_size, table_id, false, false, k_nwarps);
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, k_nwarps>(
+                    vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                    stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+                    stream);
+            };
+
+            constexpr int rdna4_base = calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4);
+            if (table_id == MMVQ_PARAMETERS_RDNA4 && rdna4_base > 1) {
+                const int need = blocks_per_iter_1warp > 0
+                    ? (blocks_per_row_x + blocks_per_iter_1warp - 1) / blocks_per_iter_1warp
+                    : 8;
+                const int k_nwarps = need <= 1 ? 1 : need <= 2 ? 2 : need <= 4 ? 4 : 8;
+                if (k_nwarps == 1) {
+                    launch_k(std::integral_constant<int, 1>{});
+                } else if (k_nwarps == 2) {
+                    launch_k(std::integral_constant<int, 2>{});
+                } else if (k_nwarps == 4) {
+                    launch_k(std::integral_constant<int, 4>{});
+                } else {
+                    launch_k(std::integral_constant<int, 8>{});
+                }
+            } else if (should_use_small_k(c_ncols_dst)) {
                 launch(std::true_type{},  std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
