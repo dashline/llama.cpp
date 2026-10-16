@@ -1305,14 +1305,28 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = sinfo.n_stream();
+
+    const size_t nb1        = ggml_row_size(k->type, hparams.n_embd_head_k(il));
+    const size_t nb2        = ggml_row_size(k->type, n_embd_k_gqa);
+    const size_t nb3_stream = ggml_row_size(k->type, n_embd_k_gqa*kv_size);
+
+    const int64_t s_step = (ns > 1) ? ((int64_t) sinfo.strm[1] - (int64_t) sinfo.strm[0]) : 1;
+    bool equi_spaced = (s_step > 0);
+    for (uint32_t s = 2; s < ns; ++s) {
+        if ((int64_t) sinfo.strm[s] - (int64_t) sinfo.strm[s - 1] != s_step) {
+            equi_spaced = false;
+            break;
+        }
+    }
+    GGML_ASSERT(equi_spaced);
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
-            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
-            ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            nb1,
+            nb2,
+            nb3_stream*s_step,
+            nb3_stream*sinfo.strm[0]);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1326,25 +1340,43 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     // [TAG_V_CACHE_VARIABLE]
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = sinfo.n_stream();
+
+    const int64_t s_step = (ns > 1) ? ((int64_t) sinfo.strm[1] - (int64_t) sinfo.strm[0]) : 1;
+    bool equi_spaced = (s_step > 0);
+    for (uint32_t s = 2; s < ns; ++s) {
+        if ((int64_t) sinfo.strm[s] - (int64_t) sinfo.strm[s - 1] != s_step) {
+            equi_spaced = false;
+            break;
+        }
+    }
+    GGML_ASSERT(equi_spaced);
 
     if (!v_trans) {
+        const size_t nb1        = ggml_row_size(v->type, hparams.n_embd_head_v(il));
+        const size_t nb2        = ggml_row_size(v->type, n_embd_v_gqa);
+        const size_t nb3_stream = ggml_row_size(v->type, n_embd_v_gqa*kv_size);
+
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
-                ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
-                ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                nb1,                    // v->nb[1]
+                nb2,                    // v->nb[2]
+                nb3_stream*s_step,      // v->nb[3]
+                nb3_stream*sinfo.strm[0]);
     }
+
+    const size_t nb1        = ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il));
+    const size_t nb2        = ggml_row_size(v->type, kv_size);
+    const size_t nb3_stream = ggml_row_size(v->type, kv_size*n_embd_v_gqa);
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
             n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
-            ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
-            ggml_row_size(v->type, kv_size),                        // v->nb[2]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+            nb1,                    // v->nb[1]
+            nb2,                    // v->nb[2]
+            nb3_stream*s_step,      // v->nb[3]
+            nb3_stream*sinfo.strm[0]);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {

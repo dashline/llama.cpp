@@ -2730,7 +2730,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    if (cgraph->n_nodes <= 0) {
+        return nullptr;
+    }
+    uintptr_t key = (uintptr_t) cgraph->nodes[0];
+    key ^= (uintptr_t) cgraph->n_nodes * 0x9e3779b97f4a7c15ULL;
+    key ^= (uintptr_t) cgraph->nodes[0]->ne[0] * 0xbf58476d1ce4e5b9ULL;
+    key ^= (uintptr_t) cgraph->nodes[0]->ne[1] * 0x94d049bb133111ebULL;
+    return (const void *) key;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {

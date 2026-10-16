@@ -665,6 +665,57 @@ static void test_split(testing & t) {
         t.assert_equal(6u, ba.get_n_used());
     });
 
+    t.test("split_equal_sequential_gaps", [&](testing & t) {
+        // {0, 2}: equi-spaced (step = 2) -> single ubatch when allow_gaps = true, split when allow_gaps = false
+        {
+            batch_builder bb;
+            bb.add(0, {0}, true);
+            bb.add(0, {2}, true);
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+
+            llama_ubatch ub = ba.split_equal(8, true, 0, true);
+            t.assert_equal(2u, ub.n_tokens);
+            t.assert_equal(2u, ub.n_seqs);
+            t.assert_equal(0, ub.seq_id[0][0]);
+            t.assert_equal(2, ub.seq_id[1][0]);
+            t.assert_equal(0u, ba.split_equal(8, true, 0, true).n_tokens);
+
+            ba.split_reset();
+            ub = ba.split_equal(8, true, 0, false);
+            t.assert_equal(1u, ub.n_tokens);
+            t.assert_equal(0, ub.seq_id[0][0]);
+            ub = ba.split_equal(8, true, 0, false);
+            t.assert_equal(1u, ub.n_tokens);
+            t.assert_equal(2, ub.seq_id[0][0]);
+            t.assert_equal(0u, ba.split_equal(8, true, 0, false).n_tokens);
+        }
+
+        // {0, 2, 3}: non-equi-spaced -> splits into {0, 2} (step = 2) and {3} when allow_gaps = true
+        {
+            batch_builder bb;
+            bb.add(0, {0}, true);
+            bb.add(0, {2}, true);
+            bb.add(0, {3}, true);
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+
+            llama_ubatch ub = ba.split_equal(8, true, 0, true);
+            t.assert_equal(2u, ub.n_tokens);
+            t.assert_equal(2u, ub.n_seqs);
+            t.assert_equal(0, ub.seq_id[0][0]);
+            t.assert_equal(2, ub.seq_id[1][0]);
+
+            ub = ba.split_equal(8, true, 0, true);
+            t.assert_equal(1u, ub.n_tokens);
+            t.assert_equal(1u, ub.n_seqs);
+            t.assert_equal(3, ub.seq_id[0][0]);
+            t.assert_equal(0u, ba.split_equal(8, true, 0, true).n_tokens);
+        }
+    });
+
     t.test("split_equal_coupled", [&](testing & t) {
         batch_builder bb;
         bb.add(0, {0, 1}, false);
