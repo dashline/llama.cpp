@@ -745,10 +745,18 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            const bool native_allowed = (K->ne[0] == 64 || K->ne[0] == 128) && (V->ne[0] == 64 || V->ne[0] == 128);
+            const bool native_profitable = K->ne[1] <= 1024;
+            const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+            const int  kv_native_K = (native_allowed && native_profitable) ? ggml_cuda_fattn_kv_native_type(K) : FATTN_KV_NATIVE_NONE;
+            const int  kv_native_V = (native_allowed && native_profitable) ? (V_is_K_view ? kv_native_K : ggml_cuda_fattn_kv_native_type(V)) : FATTN_KV_NATIVE_NONE;
+            need_f16_K = kv_native_K == FATTN_KV_NATIVE_NONE;
+            need_f16_V = kv_native_V == FATTN_KV_NATIVE_NONE;
+        } break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
