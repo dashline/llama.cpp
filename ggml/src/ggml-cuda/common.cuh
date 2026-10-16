@@ -1563,6 +1563,75 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // Per-stream cache for quantize_row_q8_1_cuda in ggml_cuda_mul_mat_vec_q to avoid
+    // redundant src1 quantization across sibling MUL_MAT / MUL_MAT_ID ops in the same graph.
+    static constexpr int MMVQ_Q8_1_CACHE_SLOTS = 2;
+    struct mmvq_q8_1_cache_slot {
+        std::unique_ptr<ggml_cuda_pool> pool;
+        char * ptr = nullptr;
+        size_t alloc_size = 0;
+        const ggml_tensor * src1_tensor = nullptr;
+        const void * src1_data = nullptr;
+        size_t src1_nbytes = 0;
+        int64_t ne10 = 0;
+        int64_t ne10_padded = 0;
+        int64_t ne11 = 0;
+        int64_t ne12 = 0;
+        int64_t ne13 = 0;
+        int64_t s11 = 0;
+        int64_t s12 = 0;
+        int64_t s13 = 0;
+        uint64_t last_use = 0;
+
+        void reset_meta() {
+            src1_tensor = nullptr;
+            src1_data = nullptr;
+            src1_nbytes = 0;
+            ne10 = 0;
+            ne10_padded = 0;
+            ne11 = 0;
+            ne12 = 0;
+            ne13 = 0;
+            s11 = 0;
+            s12 = 0;
+            s13 = 0;
+            last_use = 0;
+        }
+    };
+
+    mmvq_q8_1_cache_slot mmvq_q8_1_cache[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS][MMVQ_Q8_1_CACHE_SLOTS];
+    uint64_t mmvq_q8_1_cache_tick[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+
+    void reset_mmvq_q8_1_cache() {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            mmvq_q8_1_cache_tick[device][s] = 0;
+            for (int k = 0; k < MMVQ_Q8_1_CACHE_SLOTS; ++k) {
+                mmvq_q8_1_cache[device][s][k].reset_meta();
+            }
+        }
+    }
+
+    void invalidate_mmvq_q8_1_cache_range(const void * data, size_t nbytes) {
+        if (!data || nbytes == 0) {
+            return;
+        }
+        const uintptr_t w_begin = reinterpret_cast<uintptr_t>(data);
+        const uintptr_t w_end   = w_begin + nbytes;
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            for (int k = 0; k < MMVQ_Q8_1_CACHE_SLOTS; ++k) {
+                auto & slot = mmvq_q8_1_cache[device][s][k];
+                if (!slot.src1_data || slot.src1_nbytes == 0) {
+                    continue;
+                }
+                const uintptr_t c_begin = reinterpret_cast<uintptr_t>(slot.src1_data);
+                const uintptr_t c_end   = c_begin + slot.src1_nbytes;
+                if (w_begin < c_end && c_begin < w_end) {
+                    slot.reset_meta();
+                }
+            }
+        }
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {

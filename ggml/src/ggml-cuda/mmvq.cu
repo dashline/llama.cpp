@@ -761,13 +761,16 @@ static __global__ void mul_mat_vec_q(
 #endif
 
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
+            for (int j = 0; j < ncols_dst; ++j) {
                 tmp[j][i] += vec_dot_q_cuda(
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
+            }
+            if constexpr (has_fusion) {
+                if (use_gate) {
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
@@ -1049,7 +1052,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+    if constexpr (c_ncols_dst <= 4) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, rdna4_nwarps>, launch_params,
@@ -1060,7 +1063,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst <= 4");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, rdna4_nwarps>, launch_params,
@@ -1263,6 +1266,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             }
         } break;
         case 2: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 2;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1271,6 +1275,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 3: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 3;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1279,6 +1284,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 4: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 4;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1287,6 +1293,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 5: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 5;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1295,6 +1302,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 6: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 6;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1303,6 +1311,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 7: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 7;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1311,6 +1320,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                  dims.first, dims.second, 0, ids_stride, stream);
         } break;
         case 8: {
+            GGML_ASSERT(!fusion.shared_up);
             constexpr int c_ncols_dst = 8;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1505,7 +1515,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] <= 4);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1571,12 +1581,93 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    const size_t  q8_1_nbytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    const int64_t s11_src1    = src1->nb[1] / ts_src1;
+    const int64_t s12_src1    = src1->nb[2] / ts_src1;
+    const int64_t s13_src1    = src1->nb[3] / ts_src1;
+
+    char * src1_q8_1_ptr = nullptr;
+    ggml_cuda_pool_alloc<char> src1_q8_1_fallback(ctx.pool());
+
+    if (src1->buffer == nullptr) {
+        src1_q8_1_fallback.alloc(q8_1_nbytes);
+        src1_q8_1_ptr = src1_q8_1_fallback.get();
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11_src1, s12_src1, s13_src1, ne10_padded, ne11, ne12, ne13, stream);
+    } else {
+        const ggml_tensor * base_src1 = src1;
+        while (base_src1->op == GGML_OP_RESHAPE && base_src1->view_src != nullptr && base_src1->view_offs == 0) {
+            base_src1 = base_src1->view_src;
+        }
+        const bool is_contig_2d = ggml_is_contiguous(src1) &&
+            ((ne12 == 1 && ne13 == 1) || (ne11 == 1 && ne13 == 1));
+        const int64_t total_rows = ne11 * ne12 * ne13;
+
+        auto * slots = ctx.mmvq_q8_1_cache[ctx.device][ctx.curr_stream_no];
+        uint64_t & tick = ctx.mmvq_q8_1_cache_tick[ctx.device][ctx.curr_stream_no];
+
+        int hit_slot = -1;
+        for (int k = 0; k < ggml_backend_cuda_context::MMVQ_Q8_1_CACHE_SLOTS; ++k) {
+            const auto & slot = slots[k];
+            if (slot.ptr == nullptr || slot.src1_tensor != base_src1 || slot.src1_data != src1_d ||
+                slot.ne10 != ne10 || slot.ne10_padded != ne10_padded) {
+                continue;
+            }
+            const bool exact_match =
+                slot.ne11 == ne11 && slot.ne12 == ne12 && slot.ne13 == ne13 &&
+                slot.s11 == s11_src1 && slot.s12 == s12_src1 && slot.s13 == s13_src1;
+            const bool slot_is_contig_2d =
+                ((slot.ne12 == 1 && slot.ne13 == 1 && slot.s11 == slot.ne10) ||
+                 (slot.ne11 == 1 && slot.ne13 == 1 && slot.s12 == slot.ne10));
+            const bool contig_reshape_match =
+                is_contig_2d && slot_is_contig_2d && (slot.ne11 * slot.ne12 * slot.ne13 == total_rows);
+            if (exact_match || contig_reshape_match) {
+                hit_slot = k;
+                break;
+            }
+        }
+
+        if (hit_slot >= 0) {
+            slots[hit_slot].last_use = ++tick;
+            src1_q8_1_ptr = slots[hit_slot].ptr;
+        } else {
+            int victim = 0;
+            for (int k = 0; k < ggml_backend_cuda_context::MMVQ_Q8_1_CACHE_SLOTS; ++k) {
+                if (slots[k].src1_data == nullptr) {
+                    victim = k;
+                    break;
+                }
+                if (slots[k].last_use < slots[victim].last_use) {
+                    victim = k;
+                }
+            }
+            auto & slot = slots[victim];
+            if (slot.pool == nullptr) {
+                slot.pool = ggml_backend_cuda_context::new_pool_for_device(ctx.device, ctx.curr_stream_no);
+            }
+            if (slot.ptr != nullptr && slot.alloc_size < q8_1_nbytes) {
+                slot.pool->free(slot.ptr, slot.alloc_size);
+                slot.ptr = nullptr;
+                slot.alloc_size = 0;
+            }
+            if (slot.ptr == nullptr) {
+                slot.ptr = (char *) slot.pool->alloc(q8_1_nbytes, &slot.alloc_size);
+            }
+            slot.src1_tensor = base_src1;
+            slot.src1_data   = src1_d;
+            slot.src1_nbytes = ggml_nbytes(src1);
+            slot.ne10        = ne10;
+            slot.ne10_padded = ne10_padded;
+            slot.ne11        = ne11;
+            slot.ne12        = ne12;
+            slot.ne13        = ne13;
+            slot.s11         = s11_src1;
+            slot.s12         = s12_src1;
+            slot.s13         = s13_src1;
+            slot.last_use    = ++tick;
+            src1_q8_1_ptr    = slot.ptr;
+
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11_src1, s12_src1, s13_src1, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1602,7 +1693,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
