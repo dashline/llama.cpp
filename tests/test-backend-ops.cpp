@@ -4024,6 +4024,7 @@ struct test_add_rms_norm_mul : public test_case {
     const float eps;
     const bool keep_residual;
     const bool with_mmvq;
+    const bool with_shexp_gate;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4037,12 +4038,12 @@ struct test_add_rms_norm_mul : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(ne, eps, keep_residual, with_mmvq);
+        return VARS_TO_STR5(ne, eps, keep_residual, with_mmvq, with_shexp_gate);
     }
 
     test_add_rms_norm_mul(std::array<int64_t, 4> ne = {512, 4, 1, 1},
-            float eps = 1e-6f, bool keep_residual = true, bool with_mmvq = false)
-        : ne(ne), eps(eps), keep_residual(keep_residual), with_mmvq(with_mmvq) {}
+            float eps = 1e-6f, bool keep_residual = true, bool with_mmvq = false, bool with_shexp_gate = false)
+        : ne(ne), eps(eps), keep_residual(keep_residual), with_mmvq(with_mmvq), with_shexp_gate(with_shexp_gate) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -4052,7 +4053,19 @@ struct test_add_rms_norm_mul : public test_case {
         ggml_set_name(b, "b");
         ggml_set_name(w, "w");
 
-        ggml_tensor * add_res = ggml_add(ctx, a, b);
+        ggml_tensor * add_res = nullptr;
+        if (with_shexp_gate) {
+            ggml_tensor * c        = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_tensor * gate_inp = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne[1], ne[2], ne[3]);
+            ggml_set_name(c, "c");
+            ggml_set_name(gate_inp, "gate_inp");
+            ggml_tensor * gate_sig  = ggml_sigmoid(ctx, gate_inp);
+            ggml_tensor * shexp_out = ggml_mul(ctx, b, gate_sig);
+            ggml_tensor * ffn_out   = ggml_add(ctx, a, shexp_out);
+            add_res = ggml_add(ctx, ffn_out, c);
+        } else {
+            add_res = ggml_add(ctx, a, b);
+        }
         ggml_tensor * norm    = ggml_rms_norm(ctx, add_res, eps);
         ggml_tensor * mul_res = ggml_mul(ctx, norm, w);
 
@@ -7768,19 +7781,21 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_gate;
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
+    const bool with_down;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool with_down = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), with_down(with_down) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims)
+            + (with_down ? ",with_down=1" : "");
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7869,9 +7884,15 @@ struct test_mul_mat_vec_fusion : public test_case {
 
             ggml_tensor * out = with_gate ? build_gate(ctx, ffn_gate, ffn_up) : ffn_up;
 
-            std::array<int64_t, 4> bias2_ne   = { out->ne[0], 1, channels, samples };
-            ggml_tensor * bias2 = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias2_ne.data());
-            out = ggml_add(ctx, out, bias2);
+            if (with_down) {
+                std::array<int64_t, 4> ne_down = { n, k, channels, samples };
+                ggml_tensor * down = ggml_new_tensor(ctx, type, 4, ne_down.data());
+                out = ggml_mul_mat(ctx, down, out);
+            } else {
+                std::array<int64_t, 4> bias2_ne   = { out->ne[0], 1, channels, samples };
+                ggml_tensor * bias2 = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bias2_ne.data());
+                out = ggml_add(ctx, out, bias2);
+            }
 
             ggml_set_name(out, "out");
             return out;
@@ -7916,9 +7937,14 @@ struct test_mul_mat_vec_fusion : public test_case {
 
             ggml_tensor * out = with_gate ? build_gate(ctx, ffn_gate, ffn_up) : ffn_up;
 
-            std::array<int64_t, 4> scale_ne { 1, out->ne[1], out->ne[2], out->ne[3] };
-            ggml_tensor * scale = ggml_new_tensor(ctx, out->type, 4, scale_ne.data());
-            out = ggml_mul(ctx, out, scale);
+            if (with_down) {
+                ggml_tensor * downs = ggml_new_tensor_3d(ctx, type, n, k, n_mats);
+                out = ggml_mul_mat_id(ctx, downs, out, ids);
+            } else {
+                std::array<int64_t, 4> scale_ne { 1, out->ne[1], out->ne[2], out->ne[3] };
+                ggml_tensor * scale = ggml_new_tensor(ctx, out->type, 4, scale_ne.data());
+                out = ggml_mul(ctx, out, scale);
+            }
 
             ggml_set_name(out, "out");
             return out;
@@ -7937,6 +7963,79 @@ struct test_mul_mat_vec_fusion : public test_case {
 
     double max_nmse_err() override {
         return 5e-3;
+    }
+};
+
+// One graph, four q8_1 slots. Fused SwiGLU deposits (n=512) share one activation so
+// the src1 quantize hits. A wider plain mul_mat then reuses a retire slot and writes
+// past the q8 payload into the retire counters. Later same-layout deposits must memset
+// those counters; if retire_cnt is left set, the next consumer reads a stale q8 block.
+struct test_mmvq_q8_retire_reuse : public test_case {
+    std::string vars() override {
+        return "type=q4_k,n=512,k=256,k_wide=1024,slots=4";
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_Q8_RETIRE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-3; }
+
+    ggml_tensor * swiglu(ggml_context * ctx, ggml_tensor * cur, int64_t n, int64_t k) {
+        ggml_tensor * up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, k, n);
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, k, n);
+        ggml_tensor * ffn_up   = ggml_mul_mat(ctx, up, cur);
+        ggml_tensor * ffn_gate = ggml_mul_mat(ctx, gate, cur);
+        return ggml_glu_split(ctx, ffn_gate, ffn_up, GGML_GLU_OP_SWIGLU);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n = 512;
+        const int64_t k = 256;
+        const int64_t k_wide = 1024;
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(cur, "cur");
+
+        // Producers run first. A second sum of each tensor in the epilogue keeps its
+        // buffer live so slot invalidation cannot skip the LRU reuse this test needs.
+        std::vector<ggml_tensor *> kept;
+        ggml_tensor * seq = nullptr;
+        auto push = [&](ggml_tensor * t) {
+            kept.push_back(t);
+            ggml_tensor * touch = ggml_sum(ctx, t);
+            seq = seq ? ggml_add(ctx, seq, touch) : touch;
+        };
+
+        for (int i = 0; i < 4; ++i) {
+            push(swiglu(ctx, cur, n, k));
+        }
+
+        ggml_tensor * wide = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_wide, 1);
+        ggml_tensor * wide_w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, k_wide, n);
+        push(ggml_mul_mat(ctx, wide_w, wide));
+
+        for (int i = 0; i < 2; ++i) {
+            push(swiglu(ctx, cur, n, k));
+        }
+
+        ggml_tensor * glu = swiglu(ctx, cur, n, k);
+        ggml_tensor * down_w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, n, k);
+        ggml_tensor * down = ggml_mul_mat(ctx, down_w, glu);
+        push(down);
+
+        ggml_tensor * epi = nullptr;
+        for (ggml_tensor * t : kept) {
+            ggml_tensor * s = ggml_sum(ctx, t);
+            epi = epi ? ggml_add(ctx, epi, s) : s;
+        }
+
+        ggml_tensor * out = ggml_add(ctx, seq, epi);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -10702,6 +10801,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_tokens : { 1, 4, 8 }) {
         test_cases.emplace_back(new test_add_rms_norm_mul({ 512, n_tokens, 1, 1 }, 1e-6f, true, false));
         test_cases.emplace_back(new test_add_rms_norm_mul({ 512, n_tokens, 1, 1 }, 1e-6f, true, true));
+        test_cases.emplace_back(new test_add_rms_norm_mul({ 512, n_tokens, 1, 1 }, 1e-6f, true, false, true));
+        test_cases.emplace_back(new test_add_rms_norm_mul({ 512, n_tokens, 1, 1 }, 1e-6f, true, true,  true));
         test_cases.emplace_back(new test_rms_norm_gated({ 128, 4, n_tokens, 1 }, 1e-6f, false, true, false));
         test_cases.emplace_back(new test_rms_norm_gated({ 128, 4, n_tokens, 1 }, 1e-6f, false, true, true));
         test_cases.emplace_back(new test_rms_norm_gated({ 128, 4, n_tokens, 1 }, 1e-6f, true, false, false));
@@ -12165,6 +12266,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
+
+    // Fused up+gate+SwiGLU -> q8_1 cache deposit into downstream MUL_MAT / MUL_MAT_ID (n=512).
+    for (int64_t m_batch : { 1, 2, 4 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, m_batch, 512, 256,
+            false, 1, 1, false, false, true, false, { 1, 1 }, true));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, m_batch, 512, 256,
+            true, 8, 4, true, false, true, false, { 1, 1 }, true));
+    }
+
+    // q8_1 retire_cnt must be cleared when a non-retire writer reuses the slot.
+    test_cases.emplace_back(new test_mmvq_q8_retire_reuse());
 
     // Routed-compact MoE MMQ fused up+gate+GLU coverage (n_mats >= 8, n % 128 == 0, m > 8, no bias).
     for (ggml_type type : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {

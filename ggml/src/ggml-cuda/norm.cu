@@ -995,6 +995,69 @@ void ggml_cuda_op_rms_norm_pre_add_fused(ggml_backend_cuda_context & ctx,
                           eps, stream, pre_add_src, pre_add_dst, q8_dst);
 }
 
+// Keep a value in a lane register so later ops cannot be rescheduled across it.
+// On RDNA the gate is uniform across the row; without this, expf is scalarized
+// and mul+add contract into fma. Neither matches the split unary/mul/add kernels.
+static __device__ __forceinline__ float shexp_lane(float x) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__HIP_PLATFORM_AMD__)
+    asm volatile("" : "+v"(x));
+#elif defined(__CUDA_ARCH__)
+    asm volatile("" : "+f"(x));
+#endif
+    return x;
+}
+
+static __global__ void shexp_gate_add_f32(
+        const float * __restrict__ moe,
+        const float * __restrict__ shexp,
+        const float * __restrict__ gate_inp,
+        float *       __restrict__ dst,
+        const int                  ncols,
+        const int                  nrows) {
+    const int row = (int) blockIdx.y;
+    const int col = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= nrows || col >= ncols) {
+        return;
+    }
+
+    // op_sigmoid, then src0*src1, then src0+src1. Separate statements so this
+    // stays a mul and an add, matching k_bin_bcast rather than an fma.
+    const float gate = shexp_lane(gate_inp[row]);
+    const float sig  = shexp_lane(1.0f / (1.0f + expf(-gate)));
+    const int64_t i  = (int64_t) row * ncols + col;
+    const float prod = shexp_lane(shexp[i] * sig);
+    dst[i] = moe[i] + prod;
+}
+
+void ggml_cuda_op_rms_norm_shexp_pre_add_fused(ggml_backend_cuda_context & ctx,
+                                               ggml_tensor *               sig_tensor,
+                                               ggml_tensor *               shexp_mul_tensor,
+                                               ggml_tensor *               add1_tensor,
+                                               ggml_tensor *               add2_tensor,
+                                               ggml_tensor *               rms_tensor,
+                                               ggml_tensor *               mul_tensor) {
+    const ggml_tensor * gate_inp = sig_tensor->src[0];
+    const ggml_tensor * shexp    = (shexp_mul_tensor->src[0] == sig_tensor) ? shexp_mul_tensor->src[1] : shexp_mul_tensor->src[0];
+    const ggml_tensor * moe_out  = (add1_tensor->src[0] == shexp_mul_tensor) ? add1_tensor->src[1] : add1_tensor->src[0];
+
+    cudaStream_t stream = ctx.stream();
+    const int ncols = (int) moe_out->ne[0];
+    const int nrows = (int) ggml_nrows(moe_out);
+
+    dim3 block_dims(256, 1, 1);
+    dim3 grid_dims((ncols + block_dims.x - 1) / block_dims.x, nrows, 1);
+    ggml_cuda_grid_stall_pad(grid_dims, block_dims);
+    const ggml_cuda_kernel_launch_params launch_params{ grid_dims, block_dims, 0, stream };
+    ggml_cuda_kernel_launch(shexp_gate_add_f32, launch_params,
+        (const float *) moe_out->data, (const float *) shexp->data, (const float *) gate_inp->data,
+        (float *) add1_tensor->data, ncols, nrows);
+
+    // Residual add + RMS + norm weight stay on the existing kernel so the
+    // reduction and q8_1 epilogue match the unfused graph bit for bit.
+    ggml_cuda_op_rms_norm_pre_add_fused(ctx, add2_tensor, rms_tensor, mul_tensor);
+}
+
+
 #define RMS_NORM_GATED_LAUNCH(BLOCK_SIZE, VPT, VEC, IS_SIGMOID, DO_Q8_1) \
     do { \
         const int warps_per_block = (BLOCK_SIZE == WARP_SIZE && nrows >= 4) ? 4 : 1; \
