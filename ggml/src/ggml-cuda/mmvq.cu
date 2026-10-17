@@ -1808,16 +1808,10 @@ void ggml_cuda_mul_mat_vec_q(
                 slot.pool->free(slot.ptr, slot.alloc_size);
                 slot.ptr = nullptr;
                 slot.alloc_size = 0;
-                slot.retire_cnt = nullptr;
-                slot.retire_nbytes = 0;
             }
             if (slot.ptr == nullptr) {
                 slot.ptr = (char *) slot.pool->alloc(q8_1_nbytes, &slot.alloc_size);
             }
-            // quantize_row_q8_1_cuda writes [0, q8_1_nbytes) and may overwrite a previous
-            // deposit's retire counters; force the next retire deposit to re-zero them.
-            slot.retire_cnt = nullptr;
-            slot.retire_nbytes = 0;
             slot.src1_tensor = base_src1;
             slot.src1_data   = src1_d;
             slot.src1_nbytes = ggml_nbytes(src1);
@@ -1842,7 +1836,7 @@ void ggml_cuda_mul_mat_vec_q(
         if (deposit_rows_ok && ne0 % MATRIX_ROW_PADDING == 0 && ne0 % QK8_1 == 0 && ggml_is_contiguous(dst) && ne1 * ne2 * ne3 <= 64) {
             fusion_local.q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(
                 dst, ne0, ne0, ne1, ne2, ne3, ne0, ne0 * ne1, ne0 * ne1 * ne2,
-                &fusion_local.q8_retire_cnt, stream);
+                &fusion_local.q8_retire_cnt, 0, stream);
         }
         if (fusion->shared_dst != nullptr) {
             const int64_t s_ne0 = fusion->shared_dst->ne[0];
@@ -1854,7 +1848,7 @@ void ggml_cuda_mul_mat_vec_q(
             if (shared_rows_ok && s_ne0 % MATRIX_ROW_PADDING == 0 && s_ne0 % QK8_1 == 0 && ggml_is_contiguous(fusion->shared_dst) && s_ne1 * s_ne2 * s_ne3 <= 64) {
                 fusion_local.shared_q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(
                     fusion->shared_dst, s_ne0, s_ne0, s_ne1, s_ne2, s_ne3, s_ne0, s_ne0 * s_ne1, s_ne0 * s_ne1 * s_ne2,
-                    &fusion_local.shared_q8_retire_cnt, stream);
+                    &fusion_local.shared_q8_retire_cnt, 1, stream);
             }
         }
     }

@@ -82,36 +82,27 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-static __device__ __forceinline__ void quantize_float4_to_q8_1(
-        const float4 r, block_q8_1 * y_row, const int i4) {
-    const int ib   = i4 / 8;
-    const int sub  = i4 % 8;
-    const float v0 = r.x;
-    const float v1 = r.y;
-    const float v2 = r.z;
-    const float v3 = r.w;
-
-    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
-    float sum  = v0 + v1 + v2 + v3;
-
-    amax = warp_reduce_max<8>(amax);
-    sum  = warp_reduce_sum<8>(sum);
-
-    const float d = amax / 127.0f;
-    int32_t q4 = 0;
-    if (amax != 0.0f) {
-        const float id = 127.0f / amax;
-        const uint8_t q0 = (uint8_t)(int8_t) roundf(v0 * id);
-        const uint8_t q1 = (uint8_t)(int8_t) roundf(v1 * id);
-        const uint8_t q2 = (uint8_t)(int8_t) roundf(v2 * id);
-        const uint8_t q3 = (uint8_t)(int8_t) roundf(v3 * id);
-        q4 = (int32_t)(uint32_t(q0) | (uint32_t(q1) << 8) | (uint32_t(q2) << 16) | (uint32_t(q3) << 24));
-    }
-    reinterpret_cast<int32_t *>(y_row[ib].qs)[sub] = q4;
-    if (sub == 0) {
-        y_row[ib].ds = make_half2(d, sum);
-    }
+// Keep a value in a lane register so later ops cannot be rescheduled across it.
+// On RDNA the gate is uniform across the row; without this, expf is scalarized
+// and mul+add contract into fma. Neither matches the split unary/mul/add kernels.
+static __device__ __forceinline__ float shexp_lane(float x) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__HIP_PLATFORM_AMD__)
+    asm volatile("" : "+v"(x));
+#elif defined(__CUDA_ARCH__)
+    asm volatile("" : "+f"(x));
+#endif
+    return x;
 }
+
+// Shared-expert tail folded into the pre-add RMS norm. The pre-add operand selected by
+// `side` (0 = x, 1 = pre_add) is the routed MoE output; the value actually added is
+// moe + shexp * sigmoid(gate[row]), computed with the same op order as the split
+// SIGMOID -> MUL -> ADD kernels so the result stays bit-identical.
+struct rms_norm_shexp_args {
+    const float * shexp = nullptr;
+    const float * gate  = nullptr;
+    int           side  = 0;
+};
 
 template <int block_size, int vpt, bool do_vec, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_pre_add = false, bool do_q8_1 = false>
 static __global__ void rms_norm_f32(const float * x,
@@ -143,7 +134,8 @@ static __global__ void rms_norm_f32(const float * x,
                                     const float   scale_out            = 1.0f,
                                     const float * pre_add              = nullptr,
                                     float *       pre_add_dst          = nullptr,
-                                    block_q8_1 *  q8_dst               = nullptr) {
+                                    block_q8_1 *  q8_dst               = nullptr,
+                                    const rms_norm_shexp_args shexp    = {}) {
     ggml_cuda_pdl_lc();
     const int row = block_size == WARP_SIZE ? (int)(blockIdx.x * blockDim.y + threadIdx.y) : (int)blockIdx.x;
     const int tid = threadIdx.x;
@@ -167,6 +159,16 @@ static __global__ void rms_norm_f32(const float * x,
             [[maybe_unused]] const float * pac = do_pre_add ? (pre_add + row_idx*ncols) : nullptr;
             [[maybe_unused]] float * padstc    = (do_pre_add && pre_add_dst) ? (pre_add_dst + row_idx*ncols) : nullptr;
             [[maybe_unused]] block_q8_1 * q8c  = do_q8_1 ? (q8_dst + row_idx*(ncols / QK8_1)) : nullptr;
+
+            [[maybe_unused]] const float * shc = nullptr;
+            [[maybe_unused]] float sig = 0.0f;
+            if constexpr (do_pre_add) {
+                if (shexp.shexp != nullptr) {
+                    shc = shexp.shexp + row_idx*ncols;
+                    const float gate = shexp_lane(shexp.gate[row_idx]);
+                    sig = shexp_lane(1.0f / (1.0f + expf(-gate)));
+                }
+            }
 
             [[maybe_unused]] const float * mulc = nullptr;
             if constexpr (do_multiply) {
@@ -202,7 +204,15 @@ static __global__ void rms_norm_f32(const float * x,
                     if (i < ncols4) {
                         float4 xv = x4[i];
                         if constexpr (do_pre_add) {
-                            const float4 pv = pa4[i];
+                            float4 pv = pa4[i];
+                            if (shc != nullptr) {
+                                const float4 sv = ((const float4 *) shc)[i];
+                                float4 & moe = shexp.side == 0 ? xv : pv;
+                                moe.x += shexp_lane(sv.x * sig);
+                                moe.y += shexp_lane(sv.y * sig);
+                                moe.z += shexp_lane(sv.z * sig);
+                                moe.w += shexp_lane(sv.w * sig);
+                            }
                             xv.x += pv.x;
                             xv.y += pv.y;
                             xv.z += pv.z;
@@ -255,7 +265,12 @@ static __global__ void rms_norm_f32(const float * x,
                 for (int col = tid; col < ncols; col += block_size) {
                     float xi = xc[col];
                     if constexpr (do_pre_add) {
-                        xi += pac[col];
+                        float pi = pac[col];
+                        if (shc != nullptr) {
+                            float & moe = shexp.side == 0 ? xi : pi;
+                            moe += shexp_lane(shc[col] * sig);
+                        }
+                        xi += pi;
                         if (padstc) {
                             padstc[col] = xi;
                         }
@@ -270,7 +285,19 @@ static __global__ void rms_norm_f32(const float * x,
                 const float scale = rsqrtf(mean + eps);
 
                 for (int col = tid; col < ncols; col += block_size) {
-                    const float xi = do_pre_add ? (padstc ? padstc[col] : xc[col] + pac[col]) : xc[col];
+                    float xi = xc[col];
+                    if constexpr (do_pre_add) {
+                        if (padstc) {
+                            xi = padstc[col];
+                        } else {
+                            float pi = pac[col];
+                            if (shc != nullptr) {
+                                float & moe = shexp.side == 0 ? xi : pi;
+                                moe += shexp_lane(shc[col] * sig);
+                            }
+                            xi += pi;
+                        }
+                    }
                     if constexpr (do_multiply && do_add) {
                         const int mul_col = fastmodulo(col, mul_ncols_packed);
                         const int add_col = fastmodulo(col, add_ncols_packed);
@@ -575,7 +602,7 @@ static void group_norm_f32_cuda(
             mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, \
             add, add_stride_row, add_stride_channel, add_stride_sample, \
             add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out, \
-            pre_add, pre_add_dst, q8_dst); \
+            pre_add, pre_add_dst, q8_dst, shexp); \
     } while (0)
 
 template <bool do_multiply, bool do_add, bool do_scale, bool do_pre_add = false, bool do_q8_1 = false>
@@ -588,7 +615,8 @@ static void rms_norm_f32_dispatch(
         const ggml_tensor * add_t, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
         const uint3    add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed,
         cudaStream_t   stream, const float scale_out = 1.0f,
-        const ggml_tensor * pre_add_t = nullptr, float * pre_add_dst = nullptr, block_q8_1 * q8_dst = nullptr) {
+        const ggml_tensor * pre_add_t = nullptr, float * pre_add_dst = nullptr, block_q8_1 * q8_dst = nullptr,
+        const rms_norm_shexp_args shexp = {}) {
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
 
@@ -603,7 +631,8 @@ static void rms_norm_f32_dispatch(
     vec = vec && ggml_cuda_is_aligned(x_t, 16);
     if constexpr (do_pre_add) {
         vec = vec && ggml_cuda_is_aligned(pre_add_t, 16)
-            && (pre_add_dst == nullptr || ((uintptr_t) pre_add_dst & 15) == 0);
+            && (pre_add_dst == nullptr || ((uintptr_t) pre_add_dst & 15) == 0)
+            && (shexp.shexp == nullptr || ((uintptr_t) shexp.shexp & 15) == 0);
     }
     if constexpr (do_multiply) {
         vec = vec && mul_ncols_packed.z == (uint32_t) ncols
@@ -681,7 +710,8 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
                                   cudaStream_t   stream,
                                   const ggml_tensor * pre_add_t = nullptr,
                                   float *        pre_add_dst = nullptr,
-                                  block_q8_1 *   q8_dst = nullptr) {
+                                  block_q8_1 *   q8_dst = nullptr,
+                                  const rms_norm_shexp_args shexp = {}) {
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
     if (mul_t == nullptr) {
         rms_norm_f32_cuda(x_t, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
@@ -701,14 +731,14 @@ static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
                     mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
                     mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                     nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed, stream, 1.0f,
-                    pre_add_t, pre_add_dst, q8_dst);
+                    pre_add_t, pre_add_dst, q8_dst, shexp);
             } else {
                 rms_norm_f32_dispatch</*do_multiply*/true, /*do_add*/false, /*do_scale*/false, /*do_pre_add*/true, /*do_q8_1*/false>(
                     blocks_num, x_t, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
                     mul_t, mul_stride_row, mul_stride_channel, mul_stride_sample,
                     mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                     nullptr, 0, 0, 0, zero_packed, zero_packed, zero_packed, zero_packed, stream, 1.0f,
-                    pre_add_t, pre_add_dst, nullptr);
+                    pre_add_t, pre_add_dst, nullptr, shexp);
             }
         } else if (q8_dst != nullptr) {
             rms_norm_f32_dispatch</*do_multiply*/true, /*do_add*/false, /*do_scale*/false, /*do_pre_add*/false, /*do_q8_1*/true>(
@@ -922,14 +952,33 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           eps, stream, nullptr, nullptr, q8_dst);
 }
 
-void ggml_cuda_op_rms_norm_pre_add_fused(ggml_backend_cuda_context & ctx,
-                                         ggml_tensor *               pre_add_tensor,
-                                         ggml_tensor *               rms_norm_tensor,
-                                         ggml_tensor *               mul_tensor) {
+static void ggml_cuda_op_rms_norm_pre_add_fused_impl(ggml_backend_cuda_context & ctx,
+                                                     ggml_tensor *               pre_add_tensor,
+                                                     ggml_tensor *               rms_norm_tensor,
+                                                     ggml_tensor *               mul_tensor,
+                                                     const ggml_tensor *         shexp_add1,
+                                                     const ggml_tensor *         shexp_moe,
+                                                     const ggml_tensor *         shexp,
+                                                     const ggml_tensor *         shexp_gate) {
     const ggml_tensor * x_src       = pre_add_tensor->src[0];
     const ggml_tensor * pre_add_src = pre_add_tensor->src[1];
     float               eps         = 0.0f;
     memcpy(&eps, rms_norm_tensor->op_params, sizeof(float));
+
+    rms_norm_shexp_args shexp_args;
+    if (shexp_add1 != nullptr) {
+        // The MoE + shexp sum is never materialized; read the routed MoE output in its place.
+        if (x_src == shexp_add1) {
+            x_src = shexp_moe;
+            shexp_args.side = 0;
+        } else {
+            GGML_ASSERT(pre_add_src == shexp_add1);
+            pre_add_src = shexp_moe;
+            shexp_args.side = 1;
+        }
+        shexp_args.shexp = (const float *) shexp->data;
+        shexp_args.gate  = (const float *) shexp_gate->data;
+    }
 
     const ggml_tensor * mul_src = nullptr;
     if (mul_tensor->src[0] == rms_norm_tensor) {
@@ -978,6 +1027,7 @@ void ggml_cuda_op_rms_norm_pre_add_fused(ggml_backend_cuda_context & ctx,
         && ggml_cuda_is_aligned(x_src, 16)
         && ggml_cuda_is_aligned(pre_add_src, 16)
         && (pre_add_dst == nullptr || ((uintptr_t) pre_add_dst & 15) == 0)
+        && (shexp_args.shexp == nullptr || ((uintptr_t) shexp_args.shexp & 15) == 0)
         && mul_ncols == ne00
         && ggml_cuda_is_aligned(mul_src, 16);
 
@@ -992,41 +1042,15 @@ void ggml_cuda_op_rms_norm_pre_add_fused(ggml_backend_cuda_context & ctx,
                           mul_s01, mul_s02, mul_s03,
                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                           0, 0, 0, 0, 0, 0, 0,
-                          eps, stream, pre_add_src, pre_add_dst, q8_dst);
+                          eps, stream, pre_add_src, pre_add_dst, q8_dst, shexp_args);
 }
 
-// Keep a value in a lane register so later ops cannot be rescheduled across it.
-// On RDNA the gate is uniform across the row; without this, expf is scalarized
-// and mul+add contract into fma. Neither matches the split unary/mul/add kernels.
-static __device__ __forceinline__ float shexp_lane(float x) {
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__HIP_PLATFORM_AMD__)
-    asm volatile("" : "+v"(x));
-#elif defined(__CUDA_ARCH__)
-    asm volatile("" : "+f"(x));
-#endif
-    return x;
-}
-
-static __global__ void shexp_gate_add_f32(
-        const float * __restrict__ moe,
-        const float * __restrict__ shexp,
-        const float * __restrict__ gate_inp,
-        float *       __restrict__ dst,
-        const int                  ncols,
-        const int                  nrows) {
-    const int row = (int) blockIdx.y;
-    const int col = (int) (blockIdx.x * blockDim.x + threadIdx.x);
-    if (row >= nrows || col >= ncols) {
-        return;
-    }
-
-    // op_sigmoid, then src0*src1, then src0+src1. Separate statements so this
-    // stays a mul and an add, matching k_bin_bcast rather than an fma.
-    const float gate = shexp_lane(gate_inp[row]);
-    const float sig  = shexp_lane(1.0f / (1.0f + expf(-gate)));
-    const int64_t i  = (int64_t) row * ncols + col;
-    const float prod = shexp_lane(shexp[i] * sig);
-    dst[i] = moe[i] + prod;
+void ggml_cuda_op_rms_norm_pre_add_fused(ggml_backend_cuda_context & ctx,
+                                         ggml_tensor *               pre_add_tensor,
+                                         ggml_tensor *               rms_norm_tensor,
+                                         ggml_tensor *               mul_tensor) {
+    ggml_cuda_op_rms_norm_pre_add_fused_impl(ctx, pre_add_tensor, rms_norm_tensor, mul_tensor,
+                                             nullptr, nullptr, nullptr, nullptr);
 }
 
 void ggml_cuda_op_rms_norm_shexp_pre_add_fused(ggml_backend_cuda_context & ctx,
@@ -1040,21 +1064,10 @@ void ggml_cuda_op_rms_norm_shexp_pre_add_fused(ggml_backend_cuda_context & ctx,
     const ggml_tensor * shexp    = (shexp_mul_tensor->src[0] == sig_tensor) ? shexp_mul_tensor->src[1] : shexp_mul_tensor->src[0];
     const ggml_tensor * moe_out  = (add1_tensor->src[0] == shexp_mul_tensor) ? add1_tensor->src[1] : add1_tensor->src[0];
 
-    cudaStream_t stream = ctx.stream();
-    const int ncols = (int) moe_out->ne[0];
-    const int nrows = (int) ggml_nrows(moe_out);
-
-    dim3 block_dims(256, 1, 1);
-    dim3 grid_dims((ncols + block_dims.x - 1) / block_dims.x, nrows, 1);
-    ggml_cuda_grid_stall_pad(grid_dims, block_dims);
-    const ggml_cuda_kernel_launch_params launch_params{ grid_dims, block_dims, 0, stream };
-    ggml_cuda_kernel_launch(shexp_gate_add_f32, launch_params,
-        (const float *) moe_out->data, (const float *) shexp->data, (const float *) gate_inp->data,
-        (float *) add1_tensor->data, ncols, nrows);
-
-    // Residual add + RMS + norm weight stay on the existing kernel so the
-    // reduction and q8_1 epilogue match the unfused graph bit for bit.
-    ggml_cuda_op_rms_norm_pre_add_fused(ctx, add2_tensor, rms_tensor, mul_tensor);
+    // sigmoid(gate) * shexp + moe is folded into the pre-add of the residual RMS norm
+    // kernel; the reduction and q8_1 epilogue match the unfused graph bit for bit.
+    ggml_cuda_op_rms_norm_pre_add_fused_impl(ctx, add2_tensor, rms_tensor, mul_tensor,
+                                             add1_tensor, moe_out, shexp, gate_inp);
 }
 
 

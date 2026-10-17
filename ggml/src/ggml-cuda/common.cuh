@@ -662,6 +662,38 @@ static __device__ T block_reduce(T val, [[maybe_unused]] T * shared_vals) {
     return val;
 }
 
+// quantize one float4 (4 consecutive values, lane i4 of a 32-wide row) into a q8_1 row; 8 lanes share a block
+static __device__ __forceinline__ void quantize_float4_to_q8_1(
+        const float4 r, block_q8_1 * y_row, const int i4) {
+    const int ib   = i4 / 8;
+    const int sub  = i4 % 8;
+    const float v0 = r.x;
+    const float v1 = r.y;
+    const float v2 = r.z;
+    const float v3 = r.w;
+
+    float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+    float sum  = v0 + v1 + v2 + v3;
+
+    amax = warp_reduce_max<8>(amax);
+    sum  = warp_reduce_sum<8>(sum);
+
+    const float d = amax / 127.0f;
+    int32_t q4 = 0;
+    if (amax != 0.0f) {
+        const float id = 127.0f / amax;
+        const uint8_t q0 = (uint8_t)(int8_t) roundf(v0 * id);
+        const uint8_t q1 = (uint8_t)(int8_t) roundf(v1 * id);
+        const uint8_t q2 = (uint8_t)(int8_t) roundf(v2 * id);
+        const uint8_t q3 = (uint8_t)(int8_t) roundf(v3 * id);
+        q4 = (int32_t)(uint32_t(q0) | (uint32_t(q1) << 8) | (uint32_t(q2) << 16) | (uint32_t(q3) << 24));
+    }
+    reinterpret_cast<int32_t *>(y_row[ib].qs)[sub] = q4;
+    if (sub == 0) {
+        y_row[ib].ds = make_half2(d, sum);
+    }
+}
+
 static __device__ __forceinline__ half ggml_cuda_hmax(const half a, const half b) {
 #ifdef FP16_AVAILABLE
 
@@ -1571,8 +1603,6 @@ struct ggml_backend_cuda_context {
         std::unique_ptr<ggml_cuda_pool> pool;
         char * ptr = nullptr;
         size_t alloc_size = 0;
-        uint32_t * retire_cnt = nullptr;
-        size_t retire_nbytes = 0;
         const ggml_tensor * src1_tensor = nullptr;
         const void * src1_data = nullptr;
         size_t src1_nbytes = 0;
@@ -1604,6 +1634,39 @@ struct ggml_backend_cuda_context {
 
     mmvq_q8_1_cache_slot mmvq_q8_1_cache[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS][MMVQ_Q8_1_CACHE_SLOTS];
     uint64_t mmvq_q8_1_cache_tick[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+
+    // Retire counters for the fused q8_1 deposit in mul_mat_vec_q. Every counter is bumped
+    // with atomicInc(.., target - 1) by exactly `target` blocks per launch, so it wraps back
+    // to 0 by the time the kernel completes: the arena only has to be zeroed when it is
+    // (re)allocated, never per use. Regions 0/1: routed / shared-expert q8_1 deposits (the MoE
+    // kernel uses both in one launch with overlapping block indices); region 2: per-head
+    // last-block-done counters of the fused GDN decode kernel (same wrap-to-zero contract).
+    static constexpr int MMVQ_RETIRE_REGIONS = 3;
+    static constexpr int MMVQ_RETIRE_REGION_GDN = 2;
+    struct mmvq_retire_arena {
+        std::unique_ptr<ggml_cuda_pool> pool;
+        char * ptr = nullptr;
+        size_t nbytes = 0;
+    };
+    mmvq_retire_arena mmvq_retire[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS][MMVQ_RETIRE_REGIONS];
+
+    uint32_t * mmvq_retire_counters(int region, size_t n_blocks, cudaStream_t stream) {
+        auto & a = mmvq_retire[device][curr_stream_no][region];
+        const size_t need = GGML_PAD(n_blocks * sizeof(uint32_t), 256);
+        if (a.nbytes < need) {
+            if (a.pool == nullptr) {
+                a.pool = new_pool_for_device(device, curr_stream_no);
+            }
+            if (a.ptr != nullptr) {
+                a.pool->free(a.ptr, a.nbytes);
+                a.ptr = nullptr;
+                a.nbytes = 0;
+            }
+            a.ptr = (char *) a.pool->alloc(need, &a.nbytes);
+            CUDA_CHECK(cudaMemsetAsync(a.ptr, 0, a.nbytes, stream));
+        }
+        return reinterpret_cast<uint32_t *>(a.ptr);
+    }
 
     void reset_mmvq_q8_1_cache() {
         for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
@@ -1645,6 +1708,7 @@ struct ggml_backend_cuda_context {
             int64_t ne11, int64_t ne12, int64_t ne13,
             int64_t s11, int64_t s12, int64_t s13,
             uint32_t ** out_retire_cnt = nullptr,
+            int retire_region = 0,
             cudaStream_t stream = nullptr) {
         if (!src1_tensor || !src1_tensor->data || !src1_tensor->buffer) {
             return nullptr;
@@ -1654,9 +1718,7 @@ struct ggml_backend_cuda_context {
 
         const size_t n_blocks    = ne13 * ne12 * ne11 * ne10_padded / QK8_1;
         const size_t q8_1_nbytes = n_blocks * sizeof(block_q8_1);
-        const size_t q8_1_aligned = GGML_PAD(q8_1_nbytes, 256);
-        const size_t retire_bytes = out_retire_cnt ? GGML_PAD(n_blocks * sizeof(uint32_t), 256) : 0;
-        const size_t total_nbytes = q8_1_aligned + retire_bytes;
+        const size_t total_nbytes = GGML_PAD(q8_1_nbytes, 256);
         auto * slots = mmvq_q8_1_cache[device][curr_stream_no];
         uint64_t & tick = mmvq_q8_1_cache_tick[device][curr_stream_no];
 
@@ -1678,27 +1740,12 @@ struct ggml_backend_cuda_context {
             slot.pool->free(slot.ptr, slot.alloc_size);
             slot.ptr = nullptr;
             slot.alloc_size = 0;
-            slot.retire_cnt = nullptr;
-            slot.retire_nbytes = 0;
         }
         if (slot.ptr == nullptr) {
             slot.ptr = (char *) slot.pool->alloc(total_nbytes, &slot.alloc_size);
-            slot.retire_cnt = nullptr;
-            slot.retire_nbytes = 0;
         }
         if (out_retire_cnt != nullptr) {
-            uint32_t * rc_ptr = reinterpret_cast<uint32_t *>(slot.ptr + q8_1_aligned);
-            if (slot.retire_cnt != rc_ptr || slot.retire_nbytes < retire_bytes) {
-                CUDA_CHECK(cudaMemsetAsync(rc_ptr, 0, retire_bytes, stream));
-                slot.retire_cnt = rc_ptr;
-                slot.retire_nbytes = retire_bytes;
-            }
-            *out_retire_cnt = rc_ptr;
-        } else {
-            // A deposit without retire counters writes [0, q8_1_nbytes) and may overwrite a
-            // previous deposit's counters; force the next retire deposit to re-zero them.
-            slot.retire_cnt = nullptr;
-            slot.retire_nbytes = 0;
+            *out_retire_cnt = mmvq_retire_counters(retire_region, n_blocks, stream);
         }
         slot.src1_tensor = src1_tensor;
         slot.src1_data   = src1_tensor->data;
