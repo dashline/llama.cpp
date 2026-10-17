@@ -3662,6 +3662,47 @@ static bool ggml_cuda_match_gdn_decode(
         return false;
     }
 
+    auto ranges_overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (!a || !b || !a->data || !b->data) {
+            return false;
+        }
+        const uintptr_t a0 = (uintptr_t) a->data;
+        const uintptr_t a1 = a0 + ggml_nbytes(a);
+        const uintptr_t b0 = (uintptr_t) b->data;
+        const uintptr_t b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+
+    // Other compute nodes between the CONCAT and the SSM_CONV (the recurrent-state gather of
+    // llm_graph_context::build_rs lands here) run before the fused kernel. The kernel replaces the CONCAT and the
+    // tail CPY, so a node moved ahead of it must not read the new conv state and must not write the operands the
+    // CONCAT consumed (x, conv_state) or the conv-state cache rows. Readers of the concat were already rejected.
+    const ggml_tensor * cc   = cgraph->nodes[node_idx];
+    const ggml_tensor * cdst = gm.tail_cpy->src[1];
+    for (int j = node_idx + 1; j < gm.conv_idx; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n == gm.tail_cpy || ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (m.n_hoist >= (int) (sizeof(m.hoist) / sizeof(m.hoist[0]))) {
+            return false;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            for (const ggml_tensor * src = n->src[s]; src != nullptr; src = src->view_src) {
+                if (src == cc || src == gm.tail_cpy || src == cdst) {
+                    return false;
+                }
+            }
+            if (check_mem_ranges && ranges_overlap(n->src[s], cdst)) {
+                return false;
+            }
+        }
+        if (check_mem_ranges && (ranges_overlap(n, gm.x) || ranges_overlap(n, gm.state) || ranges_overlap(n, cdst))) {
+            return false;
+        }
+        m.hoist[m.n_hoist++] = j;
+    }
+
     const int           silu_idx = gm.conv_idx + 1;
     const ggml_tensor * silu     = cgraph->nodes[silu_idx];
     if (silu->flags & GGML_TENSOR_FLAG_OUTPUT) {
@@ -3727,6 +3768,7 @@ static bool ggml_cuda_match_gdn_decode(
     m.norm_w     = (ng.mul1->src[0] == ng.rms_norm) ? ng.mul1->src[1] : ng.mul1->src[0];
     m.z          = ng.act->src[0];
     m.out        = ng.mul2;
+    m.state_dst  = cgraph->nodes[gdn_idx + cache_skip]->src[1];
     m.concat_idx = node_idx;
     m.last_idx   = r + ng.node_count - 1;
 
@@ -3737,6 +3779,26 @@ static bool ggml_cuda_match_gdn_decode(
         const int out_nodes[2] = { gdn_idx, m.last_idx };
         if (!ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, m.last_idx - node_idx + 1, out_nodes, 2)) {
             return false;
+        }
+        // every input is read while the outputs are written; the only aliases the kernel handles are the
+        // in-place state updates of the zero-copy cache path (conv rows and recurrent rows read then written
+        // by the same threads)
+        const ggml_tensor * state_in = gdn->src[5];
+        const ggml_tensor * inputs[] = { m.x, m.conv_state, m.conv_w, m.gdn_args.raw_alpha, m.gdn_args.raw_beta,
+                                         m.gdn_args.dt_bias, m.gdn_args.ssm_a, state_in, m.z, m.norm_w };
+        const ggml_tensor * outputs[] = { ng.rms_norm->src[0], m.out, cdst, m.state_dst };
+        for (const ggml_tensor * o : outputs) {
+            for (const ggml_tensor * in : inputs) {
+                if (!ranges_overlap(o, in)) {
+                    continue;
+                }
+                const bool conv_inplace  = o == cdst && in == m.conv_state && cdst->data == m.conv_state->data &&
+                                           cdst->nb[1] == m.conv_state->nb[2];
+                const bool state_inplace = o == m.state_dst && in == state_in && m.state_dst->data == state_in->data;
+                if (!conv_inplace && !state_inplace) {
+                    return false;
+                }
+            }
         }
     }
     return true;
@@ -5133,6 +5195,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_CONCAT) {
         ggml_cuda_gdn_decode_match dm;
         if (ggml_cuda_match_gdn_decode(cgraph, i, /*check_mem_ranges=*/true, dm)) {
+            for (int h = 0; h < dm.n_hoist; ++h) {
+                ggml_tensor * hn = cgraph->nodes[dm.hoist[h]];
+                if (!ggml_cuda_compute_forward(*cuda_ctx, hn)) {
+                    GGML_ABORT("%s: op not supported %s (%s)\n", __func__, hn->name, ggml_op_name(hn->op));
+                }
+            }
             ggml_cuda_op_gdn_decode_fused(*cuda_ctx, dm);
             return dm.last_idx - i;
         }

@@ -60,6 +60,7 @@ struct ggml_cuda_gdn_decode_match {
     // gdn
     ggml_tensor *                          gdn = nullptr;
     ggml_cuda_gated_delta_net_fusion_args  gdn_args; // prologue (q/k norm, gate, beta) + cache snapshot
+    const ggml_tensor * state_dst = nullptr;  // cache view the recurrent-state CPY writes
     // gated norm
     ggml_tensor *       rms_norm = nullptr;
     const ggml_tensor * norm_w   = nullptr;   // [S_v]
@@ -67,6 +68,10 @@ struct ggml_cuda_gdn_decode_match {
     ggml_tensor *       out      = nullptr;   // final MUL
     int concat_idx = -1;
     int last_idx   = -1;                      // index of `out`
+    // unrelated compute nodes between the CONCAT and the SSM_CONV (e.g. the recurrent-state gather of
+    // llm_graph_context::build_rs); they are evaluated before the fused kernel, in graph order
+    int n_hoist = 0;
+    int hoist[16];
 };
 
 // true when the device kernel can run this match (shapes/alignment); call after the graph match

@@ -5287,32 +5287,38 @@ struct test_gdn_decode_layer : public test_case {
     const int64_t S;      // head size
     const int64_t T;      // tokens per sequence
     const int64_t n_seqs;
+    const bool    gather; // states gathered with s_copy (general build_rs path) instead of zero-copy cache views
 
     ggml_tensor * conv_cpy  = nullptr;
     ggml_tensor * state_cpy = nullptr;
     ggml_tensor * out_node  = nullptr;
+    std::vector<ggml_tensor *> extra_cpys; // write-back of the gathered extra states (gather only)
 
     std::string vars() override {
-        return VARS_TO_STR5(H, Hk, S, T, n_seqs);
+        return VARS_TO_STR6(H, Hk, S, T, n_seqs, gather);
     }
 
-    test_gdn_decode_layer(int64_t H = 4, int64_t Hk = 2, int64_t S = 128, int64_t T = 1, int64_t n_seqs = 1)
-        : H(H), Hk(Hk), S(S), T(T), n_seqs(n_seqs) {}
+    test_gdn_decode_layer(int64_t H = 4, int64_t Hk = 2, int64_t S = 128, int64_t T = 1, int64_t n_seqs = 1, bool gather = false)
+        : H(H), Hk(Hk), S(S), T(T), n_seqs(n_seqs), gather(gather) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t C = 2 * Hk * S + H * S; // conv channels: [q | k | v]
-        const int64_t D = S * S * H;
+        const int64_t C    = 2 * Hk * S + H * S; // conv channels: [q | k | v]
+        const int64_t D    = S * S * H;
+        const int64_t n_rs = gather ? n_seqs + 1 : n_seqs; // one extra (not in the ubatch) state when gathering
+
+        extra_cpys.clear();
 
         ggml_tensor * x          = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, T, n_seqs);
-        ggml_tensor * conv_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * C, n_seqs);
+        ggml_tensor * conv_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * C, n_rs);
         ggml_tensor * conv_w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
         ggml_tensor * raw_alpha  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, T, n_seqs);
         ggml_tensor * dt_bias    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         ggml_tensor * ssm_a      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         ggml_tensor * raw_beta   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, T, n_seqs);
-        ggml_tensor * ssm_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_seqs);
+        ggml_tensor * ssm_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rs);
         ggml_tensor * z          = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, T, n_seqs);
         ggml_tensor * norm_w     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S);
+        ggml_tensor * s_copy     = gather ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rs) : nullptr;
         ggml_set_name(x,          "x");
         ggml_set_name(conv_cache, "conv_cache");
         ggml_set_name(conv_w,     "conv_w");
@@ -5323,9 +5329,34 @@ struct test_gdn_decode_layer : public test_case {
         ggml_set_name(ssm_cache,  "ssm_cache");
         ggml_set_name(z,          "z");
         ggml_set_name(norm_w,     "norm_w");
+        if (s_copy) {
+            ggml_set_name(s_copy, "s_copy");
+        }
+
+        // llm_graph_context::build_rs: the ubatch states are the first n_seqs cache rows (zero-copy view), or
+        // (gather) row 0 is cleared, all n_rs states are gathered with s_copy and the extra ones written back
+        auto build_rs = [&](ggml_tensor * cache, int64_t state_size) -> ggml_tensor * {
+            if (!gather) {
+                return ggml_view_2d(ctx, cache, state_size, n_seqs, cache->nb[1], 0);
+            }
+            ggml_tensor * zero       = ggml_scale_inplace(ctx, ggml_view_1d(ctx, cache, state_size, 0), 0.0f);
+            ggml_tensor * states_all = ggml_get_rows(ctx, cache, s_copy);
+            ggml_tensor * states     = ggml_view_2d(ctx, states_all, state_size, n_seqs, states_all->nb[1], 0);
+            ggml_tensor * extra      = ggml_view_2d(ctx, states_all, state_size, n_rs - n_seqs, states_all->nb[1],
+                    n_seqs * states_all->nb[1]);
+            ggml_tensor * extra_cpy  = ggml_cpy(ctx, extra,
+                    ggml_view_2d(ctx, cache, state_size, n_rs - n_seqs, cache->nb[1], n_seqs * cache->nb[1]));
+            if (gf) {
+                ggml_build_forward_expand(gf, zero);
+                ggml_build_forward_expand(gf, states);
+                ggml_build_forward_expand(gf, extra_cpy);
+            }
+            extra_cpys.push_back(extra_cpy);
+            return states;
+        };
 
         // conv input [3 + T, C, n_seqs] and the state snapshot of its last 3 columns
-        ggml_tensor * conv_states = ggml_reshape_3d(ctx, conv_cache, 3, C, n_seqs);
+        ggml_tensor * conv_states = ggml_reshape_3d(ctx, build_rs(conv_cache, 3 * C), 3, C, n_seqs);
         ggml_tensor * conv_input  = ggml_concat(ctx, conv_states, ggml_transpose(ctx, x), 0);
         ggml_tensor * conv_last   = ggml_view_3d(ctx, conv_input, 3, C, n_seqs,
                 conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, T));
@@ -5336,7 +5367,8 @@ struct test_gdn_decode_layer : public test_case {
             ggml_build_forward_expand(gf, conv_cpy); // same node order as the model builder
         }
 
-        ggml_tensor * state = ggml_reshape_4d(ctx, ssm_cache, S, S, H, n_seqs);
+        // the recurrent-state gather lands between the conv-state cpy and the ssm_conv, as in the model
+        ggml_tensor * state = ggml_reshape_4d(ctx, build_rs(ssm_cache, D), S, S, H, n_seqs);
         if (gf) {
             ggml_build_forward_expand(gf, state);
         }
@@ -5392,7 +5424,9 @@ struct test_gdn_decode_layer : public test_case {
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
         if (gf) {
-            return { out_node, conv_cpy, state_cpy };
+            std::vector<ggml_tensor *> nodes = { out_node, conv_cpy, state_cpy };
+            nodes.insert(nodes.end(), extra_cpys.begin(), extra_cpys.end());
+            return nodes;
         }
         return { out_node };
     }
@@ -5400,7 +5434,14 @@ struct test_gdn_decode_layer : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "ssm_a") == 0) {
+            if (t->type == GGML_TYPE_I32) {
+                // s_copy: the ubatch sequences continue states 1..n_seqs, the extra state is the cleared row 0
+                std::vector<int32_t> rows(ggml_nelements(t));
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    rows[i] = (int32_t) ((i + 1) % rows.size());
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "ssm_a") == 0) {
                 init_tensor_uniform(t, -5.0f, -1e-3f);
             } else if (strcmp(t->name, "raw_alpha") == 0 || strcmp(t->name, "dt_bias") == 0 || strcmp(t->name, "raw_beta") == 0) {
                 init_tensor_uniform(t, -2.0f, 2.0f);
@@ -12542,6 +12583,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_decode_layer(2, 2, 128, 1, 3));  // H == Hk
     test_cases.emplace_back(new test_gdn_decode_layer(8, 2, 64,  1, 1));  // S != 128: generic path
     test_cases.emplace_back(new test_gdn_decode_layer(32, 16, 128, 1, 1)); // Qwen3.5/3.6 shape
+    // gathered states (general build_rs path: the gather sits between the conv-state cpy and the ssm_conv)
+    for (int64_t n_seqs : { 1, 2 }) {
+        for (int64_t T : { 1, 8 }) {
+            test_cases.emplace_back(new test_gdn_decode_layer(4, 2, 128, T, n_seqs, /*gather=*/true));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_decode_layer(32, 16, 128, 1, 1, /*gather=*/true));
+    test_cases.emplace_back(new test_gdn_decode_layer(32, 16, 128, 2, 2, /*gather=*/true));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
