@@ -1566,11 +1566,13 @@ struct ggml_backend_cuda_context {
 
     // Per-stream cache for quantize_row_q8_1_cuda in ggml_cuda_mul_mat_vec_q to avoid
     // redundant src1 quantization across sibling MUL_MAT / MUL_MAT_ID ops in the same graph.
-    static constexpr int MMVQ_Q8_1_CACHE_SLOTS = 2;
+    static constexpr int MMVQ_Q8_1_CACHE_SLOTS = 4;
     struct mmvq_q8_1_cache_slot {
         std::unique_ptr<ggml_cuda_pool> pool;
         char * ptr = nullptr;
         size_t alloc_size = 0;
+        uint32_t * retire_cnt = nullptr;
+        size_t retire_nbytes = 0;
         const ggml_tensor * src1_tensor = nullptr;
         const void * src1_data = nullptr;
         size_t src1_nbytes = 0;
@@ -1612,7 +1614,7 @@ struct ggml_backend_cuda_context {
         }
     }
 
-    void invalidate_mmvq_q8_1_cache_range(const void * data, size_t nbytes, const ggml_tensor * keep_tensor = nullptr) {
+    void invalidate_mmvq_q8_1_cache_range(const void * data, size_t nbytes, const ggml_tensor * keep_tensor = nullptr, const ggml_tensor * keep_tensor2 = nullptr) {
         if (!data || nbytes == 0) {
             return;
         }
@@ -1624,7 +1626,8 @@ struct ggml_backend_cuda_context {
                 if (!slot.src1_data || slot.src1_nbytes == 0) {
                     continue;
                 }
-                if (keep_tensor != nullptr && slot.src1_tensor == keep_tensor) {
+                if ((keep_tensor != nullptr && slot.src1_tensor == keep_tensor) ||
+                    (keep_tensor2 != nullptr && slot.src1_tensor == keep_tensor2)) {
                     continue;
                 }
                 const uintptr_t c_begin = reinterpret_cast<uintptr_t>(slot.src1_data);
@@ -1640,14 +1643,20 @@ struct ggml_backend_cuda_context {
             const ggml_tensor * src1_tensor,
             int64_t ne10, int64_t ne10_padded,
             int64_t ne11, int64_t ne12, int64_t ne13,
-            int64_t s11, int64_t s12, int64_t s13) {
+            int64_t s11, int64_t s12, int64_t s13,
+            uint32_t ** out_retire_cnt = nullptr,
+            cudaStream_t stream = nullptr) {
         if (!src1_tensor || !src1_tensor->data || !src1_tensor->buffer) {
             return nullptr;
         }
         const size_t src1_nbytes = ggml_nbytes(src1_tensor);
         invalidate_mmvq_q8_1_cache_range(src1_tensor->data, src1_nbytes, nullptr);
 
-        const size_t q8_1_nbytes = ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1;
+        const size_t n_blocks    = ne13 * ne12 * ne11 * ne10_padded / QK8_1;
+        const size_t q8_1_nbytes = n_blocks * sizeof(block_q8_1);
+        const size_t q8_1_aligned = GGML_PAD(q8_1_nbytes, 256);
+        const size_t retire_bytes = out_retire_cnt ? GGML_PAD(n_blocks * sizeof(uint32_t), 256) : 0;
+        const size_t total_nbytes = q8_1_aligned + retire_bytes;
         auto * slots = mmvq_q8_1_cache[device][curr_stream_no];
         uint64_t & tick = mmvq_q8_1_cache_tick[device][curr_stream_no];
 
@@ -1665,13 +1674,31 @@ struct ggml_backend_cuda_context {
         if (slot.pool == nullptr) {
             slot.pool = new_pool_for_device(device, curr_stream_no);
         }
-        if (slot.ptr != nullptr && slot.alloc_size < q8_1_nbytes) {
+        if (slot.ptr != nullptr && slot.alloc_size < total_nbytes) {
             slot.pool->free(slot.ptr, slot.alloc_size);
             slot.ptr = nullptr;
             slot.alloc_size = 0;
+            slot.retire_cnt = nullptr;
+            slot.retire_nbytes = 0;
         }
         if (slot.ptr == nullptr) {
-            slot.ptr = (char *) slot.pool->alloc(q8_1_nbytes, &slot.alloc_size);
+            slot.ptr = (char *) slot.pool->alloc(total_nbytes, &slot.alloc_size);
+            slot.retire_cnt = nullptr;
+            slot.retire_nbytes = 0;
+        }
+        if (out_retire_cnt != nullptr) {
+            uint32_t * rc_ptr = reinterpret_cast<uint32_t *>(slot.ptr + q8_1_aligned);
+            if (slot.retire_cnt != rc_ptr || slot.retire_nbytes < retire_bytes) {
+                CUDA_CHECK(cudaMemsetAsync(rc_ptr, 0, retire_bytes, stream));
+                slot.retire_cnt = rc_ptr;
+                slot.retire_nbytes = retire_bytes;
+            }
+            *out_retire_cnt = rc_ptr;
+        } else {
+            // A deposit without retire counters writes [0, q8_1_nbytes) and may overwrite a
+            // previous deposit's counters; force the next retire deposit to re-zero them.
+            slot.retire_cnt = nullptr;
+            slot.retire_nbytes = 0;
         }
         slot.src1_tensor = src1_tensor;
         slot.src1_data   = src1_tensor->data;
@@ -1713,6 +1740,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    block_q8_1 * q8_dst = nullptr;
+    uint32_t * q8_retire_cnt = nullptr;
+    block_q8_1 * shared_q8_dst = nullptr;
+    uint32_t * shared_q8_retire_cnt = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

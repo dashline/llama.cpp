@@ -303,8 +303,8 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 /* gated ops */
 
-template <float (*op)(float), typename T>
-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+template <float (*op)(float), typename T, bool do_q8_1 = false>
+static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, block_q8_1 * q8_dst = nullptr) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -317,14 +317,39 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
 
     ggml_cuda_pdl_sync();
-    dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]));
+    const float val = op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]);
+    dst[i] = ggml_cuda_cast<T>(val);
+
+    if constexpr (do_q8_1) {
+        const int lane = threadIdx.x & 31;
+        float amax = fabsf(val);
+        float sum  = val;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 32));
+            sum  += __shfl_xor_sync(0xFFFFFFFF, sum, mask, 32);
+        }
+        const float d = amax / 127.0f;
+        const int8_t q = (amax == 0.0f) ? 0 : (int8_t) roundf(val / d);
+        const int64_t ib = i / QK8_1;
+        q8_dst[ib].qs[lane] = q;
+        if (lane == 0) {
+            q8_dst[ib].ds = make_half2(d, sum);
+        }
+    }
 }
 
 template <float (*op)(float), typename T>
-static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
+static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream, block_q8_1 * q8_dst = nullptr) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+    if constexpr (std::is_same_v<T, float>) {
+        if (q8_dst != nullptr) {
+            ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, true>, launch_params, x, g, dst, k, n, o0, o1, q8_dst);
+            return;
+        }
+    }
+    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T, false>, launch_params, x, g, dst, k, n, o0, o1, nullptr);
 }
 
 template <float (*op)(float)>
@@ -386,7 +411,18 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             src1_p += swapped ? 0 : nc;
         }
 
-        unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
+        block_q8_1 * q8_dst = nullptr;
+        const int64_t k     = ggml_nelements(dst);
+        const int64_t nrows = ggml_nrows(dst);
+        if (nc % MATRIX_ROW_PADDING == 0 && k % QK8_1 == 0 && nrows <= 64 && ggml_is_contiguous(dst)) {
+            const int64_t ne00 = dst->ne[0];
+            const int64_t ne01 = dst->ne[1];
+            const int64_t ne02 = dst->ne[2];
+            const int64_t ne03 = dst->ne[3];
+            q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(dst, ne00, ne00, ne01, ne02, ne03, ne00, ne00 * ne01, ne00 * ne01 * ne02);
+        }
+
+        unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, k, nc, src0_o / sizeof(float), src1_o / sizeof(float), stream, q8_dst);
     }
 }
 
@@ -744,9 +780,18 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                              (nv_bfloat16 *) mul_node->data, k, nc,
                              unary_stride / sizeof(nv_bfloat16), other_stride / sizeof(nv_bfloat16), stream);
     } else {
+        block_q8_1 * q8_dst = nullptr;
+        const int64_t nrows = ggml_nrows(mul_node);
+        if (nc % MATRIX_ROW_PADDING == 0 && k % QK8_1 == 0 && nrows <= 64 && ggml_is_contiguous(mul_node)) {
+            const int64_t ne00 = mul_node->ne[0];
+            const int64_t ne01 = mul_node->ne[1];
+            const int64_t ne02 = mul_node->ne[2];
+            const int64_t ne03 = mul_node->ne[3];
+            q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(mul_node, ne00, ne00, ne01, ne02, ne03, ne00, ne00 * ne01, ne00 * ne01 * ne02);
+        }
         unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
                              (float *) mul_node->data, k, nc,
-                             unary_stride / sizeof(float), other_stride / sizeof(float), stream);
+                             unary_stride / sizeof(float), other_stride / sizeof(float), stream, q8_dst);
     }
 }
 
