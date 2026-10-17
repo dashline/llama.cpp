@@ -763,6 +763,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                     slot.alloc_size = 0;
                 }
             }
+            for (int r = 0; r < MMVQ_RETIRE_REGIONS; ++r) {
+                auto & arena = mmvq_retire[i][j][r];
+                if (arena.ptr != nullptr && arena.pool != nullptr) {
+                    arena.pool->free(arena.ptr, arena.nbytes);
+                    arena.ptr = nullptr;
+                    arena.nbytes = 0;
+                }
+            }
         }
     }
 }
@@ -3635,6 +3643,105 @@ static bool ggml_cuda_match_rms_norm_gated(
     return true;
 }
 
+// whole GDN layer at decode (see ggml_cuda_gdn_decode_match): conv concat/state cpy/ssm_conv/silu
+// -> q/k/v views -> GDN prologue -> gated_delta_net -> state cpy -> rms_norm_gated
+static bool ggml_cuda_match_gdn_decode(
+        const ggml_cgraph * cgraph, int node_idx, const bool check_mem_ranges, ggml_cuda_gdn_decode_match & m) {
+    static const bool disable = getenv("GGML_CUDA_DISABLE_GDN_DECODE_FUSION") != nullptr;
+    if (disable) {
+        return false;
+    }
+    m = {};
+
+    ggml_cuda_gdn_conv_match gm;
+    if (!ggml_cuda_gdn_conv_match_at_concat(cgraph, node_idx, gm, /*decode=*/true)) {
+        return false;
+    }
+    // exactly one conv-state writer, covering the last 3 concat columns (n_rs_seq == 0)
+    if (gm.n_tail_cpy != 1 || gm.tail_cpy == nullptr || gm.tail_from != gm.T) {
+        return false;
+    }
+
+    const int           silu_idx = gm.conv_idx + 1;
+    const ggml_tensor * silu     = cgraph->nodes[silu_idx];
+    if (silu->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+
+    // the conv output is only consumed through the q/k/v views that directly follow it
+    int p = silu_idx + 1;
+    while (p < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[p])) {
+        if (cgraph->nodes[p]->view_src != silu || (cgraph->nodes[p]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return false;
+        }
+        ++p;
+    }
+    if (p >= cgraph->n_nodes || ggml_node_get_use_count(cgraph, silu_idx) != p - silu_idx - 1) {
+        return false;
+    }
+
+    int gdn_idx = -1;
+    if (!ggml_cuda_try_gdn_prologue_fusion(cgraph, p, m.gdn_args, gdn_idx, check_mem_ranges)) {
+        return false;
+    }
+    if (!m.gdn_args.fuse_qk_norm || !m.gdn_args.fuse_gate || !m.gdn_args.fuse_beta_sigmoid) {
+        return false;
+    }
+    ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    if (m.gdn_args.raw_q->view_src != silu || m.gdn_args.raw_k->view_src != silu || gdn->src[2]->view_src != silu) {
+        return false;
+    }
+
+    const int cache_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, gdn_idx, m.gdn_args.cache);
+    if (cache_skip <= 0 || m.gdn_args.cache.slot_stride != 0) {
+        return false;
+    }
+    m.gdn_args.has_cache_fusion = true;
+
+    // gdn output feeds only the snapshot cpy and the gated norm
+    if (ggml_node_get_use_count(cgraph, gdn_idx) != 2) {
+        return false;
+    }
+    int r = gdn_idx + cache_skip + 1;
+    while (r < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[r])) {
+        if (cgraph->nodes[r]->view_src != gdn || (cgraph->nodes[r]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return false;
+        }
+        ++r;
+    }
+    ggml_cuda_rms_norm_gated_match ng;
+    if (r >= cgraph->n_nodes || !ggml_cuda_match_rms_norm_gated(cgraph, r, check_mem_ranges, &ng)) {
+        return false;
+    }
+    if (ggml_get_unary_op(ng.act) != GGML_UNARY_OP_SILU) {
+        return false;
+    }
+
+    m.x          = gm.x;
+    m.conv_state = gm.state;
+    m.conv_w     = gm.w;
+    m.conv_cpy   = gm.tail_cpy;
+    m.conv_out   = gm.conv_out;
+    m.gdn        = gdn;
+    m.rms_norm   = ng.rms_norm;
+    m.norm_w     = (ng.mul1->src[0] == ng.rms_norm) ? ng.mul1->src[1] : ng.mul1->src[0];
+    m.z          = ng.act->src[0];
+    m.out        = ng.mul2;
+    m.concat_idx = node_idx;
+    m.last_idx   = r + ng.node_count - 1;
+
+    if (!ggml_cuda_gdn_decode_supported(m)) {
+        return false;
+    }
+    if (check_mem_ranges) {
+        const int out_nodes[2] = { gdn_idx, m.last_idx };
+        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, m.last_idx - node_idx + 1, out_nodes, 2)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_match_add_rms_norm_mul(
         const ggml_cgraph * cgraph, int node_idx, const bool check_mem_ranges) {
     static const ggml_op ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
@@ -5023,6 +5130,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (node->op == GGML_OP_CONCAT) {
+        ggml_cuda_gdn_decode_match dm;
+        if (ggml_cuda_match_gdn_decode(cgraph, i, /*check_mem_ranges=*/true, dm)) {
+            ggml_cuda_op_gdn_decode_fused(*cuda_ctx, dm);
+            return dm.last_idx - i;
+        }
+    }
+
     if (int skip = ggml_cuda_gdn_conv_try_fuse(cuda_ctx, cgraph, i)) {
         return skip;
     }
@@ -5452,6 +5567,22 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
 
             if (cgraph->nodes[i]->op == GGML_OP_CONCAT) {
+                ggml_cuda_gdn_decode_match dm;
+                if (ggml_cuda_match_gdn_decode(cgraph, i, /*check_mem_ranges=*/false, dm)) {
+                    // inputs are read while the gdn output / final mul are written: keep every
+                    // source (and the base of every view) alive until the fused kernel is done
+                    add_alloc_deps(i, dm.last_idx);
+                    for (int k = i; k <= dm.last_idx; ++k) {
+                        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                            ggml_tensor * s = cgraph->nodes[k]->src[j];
+                            if (s && s->view_src) {
+                                params->add_alloc_dep(params->user_data, s->view_src, cgraph->nodes[dm.last_idx]);
+                            }
+                        }
+                    }
+                    i = dm.last_idx;
+                    continue;
+                }
                 ggml_cuda_gdn_conv_match gm;
                 if (ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(gm.x), gm.conv_out);

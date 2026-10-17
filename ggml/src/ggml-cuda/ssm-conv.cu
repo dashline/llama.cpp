@@ -300,9 +300,9 @@ static bool gdn_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
     return a0 < b1 && b0 < a1;
 }
 
-bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int concat_idx, ggml_cuda_gdn_conv_match & out) {
+bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int concat_idx, ggml_cuda_gdn_conv_match & out, bool decode) {
     static const bool disable = getenv("GGML_CUDA_DISABLE_GDN_CONV_DIRECT") != nullptr;
-    if (disable) {
+    if (disable && !decode) {
         return false;
     }
     if (concat_idx < 0 || concat_idx >= cgraph->n_nodes) {
@@ -330,13 +330,20 @@ bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int concat_i
     if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(st) || !ggml_is_contiguous(cc)) {
         return false;
     }
-    if (st->ne[2] != 1 || st->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1) {
+    const int64_t n_seqs = x->ne[2];
+    if (st->ne[3] != 1 || x->ne[3] != 1 || st->ne[2] != n_seqs || tr->ne[2] != n_seqs || cc->ne[2] != n_seqs) {
+        return false;
+    }
+    if (!decode && n_seqs != 1) {
         return false;
     }
 
     const int64_t C = x->ne[0];
     const int64_t T = x->ne[1];
-    if (C <= 0 || C % 256 != 0 || T < 64) {
+    if (C <= 0 || C % 256 != 0) {
+        return false;
+    }
+    if (decode ? (T < 1 || T > GGML_CUDA_GDN_DECODE_MAX_TOKENS) : (T < 64)) {
         return false;
     }
     if (st->ne[0] != 3 || st->ne[1] != C) {
@@ -349,10 +356,12 @@ bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int concat_i
         return false;
     }
 
-    int     conv_idx  = -1;
-    int64_t tail_from = T + 3;
-    int     cc_uses   = 1; // SSM_CONV itself
-    const int limit   = std::min(cgraph->n_nodes, concat_idx + 16);
+    int     conv_idx   = -1;
+    int64_t tail_from  = T + 3;
+    int     cc_uses    = 1; // SSM_CONV itself
+    int     n_tail_cpy = 0;
+    const ggml_tensor * tail_cpy = nullptr;
+    const int limit    = std::min(cgraph->n_nodes, concat_idx + 16);
 
     for (int j = concat_idx + 1; j < limit; ++j) {
         ggml_tensor * n = cgraph->nodes[j];
@@ -360,11 +369,18 @@ bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int concat_i
             conv_idx = j;
             break;
         }
+        if (n->op == GGML_OP_CPY && n->src[0] && n->src[0]->op == GGML_OP_VIEW && n->src[0]->view_src == cc) {
+            if (tail_cpy == nullptr) {
+                tail_cpy = n;
+            }
+            ++n_tail_cpy;
+            continue;
+        }
         if (n->op == GGML_OP_VIEW && n->view_src == cc) {
-            if (n->ne[1] != C || n->ne[2] != 1 || n->ne[3] != 1) {
+            if (n->ne[1] != C || n->ne[2] != n_seqs || n->ne[3] != 1) {
                 return false;
             }
-            if (n->nb[0] != sizeof(float) || n->nb[1] != cc->nb[1]) {
+            if (n->nb[0] != sizeof(float) || n->nb[1] != cc->nb[1] || (n_seqs > 1 && n->nb[2] != cc->nb[2])) {
                 return false;
             }
             const size_t byte_off = n->view_offs;
@@ -372,7 +388,7 @@ bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int concat_i
                 return false;
             }
             const int64_t col0 = (int64_t) (byte_off / sizeof(float));
-            if (col0 < 3 || col0 + n->ne[0] > T + 3) {
+            if (col0 < (decode ? 0 : 3) || col0 + n->ne[0] > T + 3) {
                 return false;
             }
             if (ggml_node_get_use_count(cgraph, j) != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
@@ -445,7 +461,7 @@ bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int concat_i
     if (conv->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 || !ggml_is_contiguous(silu)) {
         return false;
     }
-    if (silu->ne[0] != C || silu->ne[1] != T || silu->ne[2] != 1 || silu->ne[3] != 1) {
+    if (silu->ne[0] != C || silu->ne[1] != T || silu->ne[2] != n_seqs || silu->ne[3] != 1) {
         return false;
     }
 
@@ -471,10 +487,13 @@ bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int concat_i
     out.w          = w;
     out.concat     = cc;
     out.conv_out   = silu;
+    out.tail_cpy   = tail_cpy;
+    out.n_tail_cpy = n_tail_cpy;
     out.concat_idx = concat_idx;
     out.conv_idx   = conv_idx;
     out.C          = C;
     out.T          = T;
+    out.n_seqs     = n_seqs;
     out.tail_from  = tail_from;
     return true;
 }
