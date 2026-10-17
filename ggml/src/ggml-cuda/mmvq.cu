@@ -849,6 +849,42 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
+    if constexpr (has_fusion && (QK8_1 % rows_per_cuda_block == 0)) {
+        block_q8_1 * q8_out     = shared_expert ? fusion.shared_q8_dst        : fusion.q8_dst;
+        uint32_t   * retire_cnt = shared_expert ? fusion.shared_q8_retire_cnt : fusion.q8_retire_cnt;
+        if (threadIdx.y == 0 && q8_out != nullptr && (nrows_x % QK8_1 == 0 || uint32_t(row0 & ~(QK8_1 - 1)) + QK8_1 <= nrows_x)) {
+            __threadfence();
+            constexpr uint32_t target = QK8_1 / rows_per_cuda_block;
+            const uint32_t row_block_base = (uint32_t) row0 & ~(uint32_t)(QK8_1 - 1);
+            const volatile float * dst_base = (const volatile float *) (dst - row0 + row_block_base);
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const uint32_t elem_base = sample_dst * stride_sample_dst + channel_dst * stride_channel_dst + j * stride_col_dst + row_block_base;
+                const uint32_t ib = elem_base / QK8_1;
+                int is_last = 0;
+    #if !defined(GGML_USE_HIP)
+                // CUDA independent thread scheduling: lane 0 must not atomicInc
+                // until every lane has finished the dst store above.
+                __syncwarp();
+#endif
+                if (threadIdx.x == 0) {
+                    is_last = (atomicInc(&retire_cnt[ib], target - 1) == target - 1);
+                }
+                if (__shfl_sync(0xFFFFFFFF, is_last, 0, QK8_1)) {
+                    const float xi   = dst_base[j * stride_col_dst + threadIdx.x];
+                    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+                    const float sum  = warp_reduce_sum<QK8_1>(xi);
+                    const float d    = amax / 127.0f;
+                    const int8_t q   = amax == 0.0f ? 0 : roundf(xi / d);
+                    q8_out[ib].qs[threadIdx.x] = q;
+                    if (threadIdx.x == 0) {
+                        q8_out[ib].ds = make_half2(d, sum);
+                    }
+                }
+            }
+        }
+    }
+
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
     }
@@ -1045,6 +1081,38 @@ static __global__ void mul_mat_vec_q_moe(
             }
         }
         dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
+    }
+
+    if constexpr (has_fusion && (QK8_1 % c_rows_per_block == 0)) {
+        block_q8_1 * q8_out     = shared_expert ? fusion.shared_q8_dst        : fusion.q8_dst;
+        uint32_t   * retire_cnt = shared_expert ? fusion.shared_q8_retire_cnt : fusion.q8_retire_cnt;
+        if ((nwarps_per_token == 1 || threadIdx.z == 0) && q8_out != nullptr && (nrows_x % QK8_1 == 0 || uint32_t(row0 & ~(QK8_1 - 1)) + QK8_1 <= nrows_x)) {
+            __threadfence();
+            constexpr uint32_t target = QK8_1 / c_rows_per_block;
+            const uint32_t row_block_base = (uint32_t) row0 & ~(uint32_t)(QK8_1 - 1);
+            const uint32_t elem_base      = channel_dst * stride_channel_dst + token_idx * stride_col_dst + row_block_base;
+            const uint32_t ib             = elem_base / QK8_1;
+            int is_last = 0;
+#if !defined(GGML_USE_HIP)
+            // CUDA independent thread scheduling: lane 0 must not atomicInc
+            // until every lane has finished the dst store above.
+            __syncwarp();
+#endif
+            if (threadIdx.x == 0) {
+                is_last = (atomicInc(&retire_cnt[ib], target - 1) == target - 1);
+            }
+            if (__shfl_sync(0xFFFFFFFF, is_last, 0, QK8_1)) {
+                const float xi   = ((const volatile float *) dst)[elem_base + threadIdx.x];
+                const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+                const float sum  = warp_reduce_sum<QK8_1>(xi);
+                const float d    = amax / 127.0f;
+                const int8_t q   = amax == 0.0f ? 0 : roundf(xi / d);
+                q8_out[ib].qs[threadIdx.x] = q;
+                if (threadIdx.x == 0) {
+                    q8_out[ib].ds = make_half2(d, sum);
+                }
+            }
+        }
     }
 
     if constexpr (!has_fusion) {
@@ -1546,6 +1614,36 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// Fused kernels write the q8_1 deposit only when QK8_1 % rows_per_block == 0
+// (mul_mat_vec_q / mul_mat_vec_q_moe). Skip registration otherwise: a slot the
+// kernel never fills would be a hit of stale bytes for the next consumer.
+static bool mmvq_q8_deposit_rows_ok(ggml_type type, int ncols_dst, bool has_ids) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+
+    if (has_ids && ncols_dst > 1) {
+        constexpr int rows_per_block = 2; // mul_mat_vec_q_moe_launch
+        return QK8_1 % rows_per_block == 0;
+    }
+
+    // ncols_dst > 1 and RDNA4 c=1 (launch_k) pass small_k = false.
+    // Other c=1 paths may compile small_k, where rows_per_block becomes nwarps.
+    const int rows_per_block = calc_rows_per_block(ncols_dst, table_id, /*small_k=*/false, /*nwarps=*/1);
+    if (rows_per_block <= 0 || QK8_1 % rows_per_block != 0) {
+        return false;
+    }
+    const bool rdna4_launch_k = ncols_dst == 1 && table_id == MMVQ_PARAMETERS_RDNA4 &&
+                                calc_nwarps(type, 1, MMVQ_PARAMETERS_RDNA4) > 1;
+    if (ncols_dst == 1 && !rdna4_launch_k && !GGML_CUDA_CC_IS_RDNA(cc)) {
+        const int nwarps = calc_nwarps(type, ncols_dst, table_id);
+        const int rows_small = calc_rows_per_block(ncols_dst, table_id, /*small_k=*/true, nwarps);
+        if (rows_small <= 0 || QK8_1 % rows_small != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1710,10 +1808,16 @@ void ggml_cuda_mul_mat_vec_q(
                 slot.pool->free(slot.ptr, slot.alloc_size);
                 slot.ptr = nullptr;
                 slot.alloc_size = 0;
+                slot.retire_cnt = nullptr;
+                slot.retire_nbytes = 0;
             }
             if (slot.ptr == nullptr) {
                 slot.ptr = (char *) slot.pool->alloc(q8_1_nbytes, &slot.alloc_size);
             }
+            // quantize_row_q8_1_cuda writes [0, q8_1_nbytes) and may overwrite a previous
+            // deposit's retire counters; force the next retire deposit to re-zero them.
+            slot.retire_cnt = nullptr;
+            slot.retire_nbytes = 0;
             slot.src1_tensor = base_src1;
             slot.src1_data   = src1_d;
             slot.src1_nbytes = ggml_nbytes(src1);
@@ -1729,6 +1833,29 @@ void ggml_cuda_mul_mat_vec_q(
             src1_q8_1_ptr    = slot.ptr;
 
             quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11_src1, s12_src1, s13_src1, ne10_padded, ne11, ne12, ne13, stream);
+        }
+    }
+
+    if (fusion != nullptr && fusion->gate != nullptr) {
+        const int64_t ncols_dst_deposit = ids ? ne2 : ne1;
+        const bool deposit_rows_ok = mmvq_q8_deposit_rows_ok(src0->type, (int) ncols_dst_deposit, ids != nullptr);
+        if (deposit_rows_ok && ne0 % MATRIX_ROW_PADDING == 0 && ne0 % QK8_1 == 0 && ggml_is_contiguous(dst) && ne1 * ne2 * ne3 <= 64) {
+            fusion_local.q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(
+                dst, ne0, ne0, ne1, ne2, ne3, ne0, ne0 * ne1, ne0 * ne1 * ne2,
+                &fusion_local.q8_retire_cnt, stream);
+        }
+        if (fusion->shared_dst != nullptr) {
+            const int64_t s_ne0 = fusion->shared_dst->ne[0];
+            const int64_t s_ne1 = fusion->shared_dst->ne[1];
+            const int64_t s_ne2 = fusion->shared_dst->ne[2];
+            const int64_t s_ne3 = fusion->shared_dst->ne[3];
+            // Shared expert is the non-id mul_mat_vec_q lane (rows_per_block from ncols = s_ne1).
+            const bool shared_rows_ok = mmvq_q8_deposit_rows_ok(src0->type, (int) s_ne1, /*has_ids=*/false);
+            if (shared_rows_ok && s_ne0 % MATRIX_ROW_PADDING == 0 && s_ne0 % QK8_1 == 0 && ggml_is_contiguous(fusion->shared_dst) && s_ne1 * s_ne2 * s_ne3 <= 64) {
+                fusion_local.shared_q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(
+                    fusion->shared_dst, s_ne0, s_ne0, s_ne1, s_ne2, s_ne3, s_ne0, s_ne0 * s_ne1, s_ne0 * s_ne1 * s_ne2,
+                    &fusion_local.shared_q8_retire_cnt, stream);
+            }
         }
     }
 

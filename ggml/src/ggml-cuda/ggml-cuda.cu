@@ -3671,6 +3671,92 @@ static bool ggml_cuda_match_add_rms_norm_mul(
     return true;
 }
 
+static bool ggml_cuda_match_shexp_add_rms_norm_mul(
+        const ggml_cgraph * cgraph, int node_idx, const bool check_mem_ranges) {
+    static const ggml_op ops[6] = {
+        GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL
+    };
+    int out_nodes[2] = { node_idx + 3, node_idx + 5 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, 6, ops, out_nodes, 2)) {
+        return false;
+    }
+
+    const ggml_tensor * sig      = cgraph->nodes[node_idx];
+    const ggml_tensor * smul     = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add1     = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * add2     = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * mul      = cgraph->nodes[node_idx + 5];
+
+    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    if (smul->src[0] != sig && smul->src[1] != sig) {
+        return false;
+    }
+    if (add1->src[0] != smul && add1->src[1] != smul) {
+        return false;
+    }
+    if (add2->src[0] != add1 && add2->src[1] != add1) {
+        return false;
+    }
+    if (rms_norm->src[0] != add2 || (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return false;
+    }
+
+    const ggml_tensor * gate_inp = sig->src[0];
+    const ggml_tensor * shexp    = (smul->src[0] == sig) ? smul->src[1] : smul->src[0];
+    const ggml_tensor * moe_out  = (add1->src[0] == smul) ? add1->src[1] : add1->src[0];
+    const ggml_tensor * residual = (add2->src[0] == add1) ? add2->src[1] : add2->src[0];
+    const ggml_tensor * mul_w    = (mul->src[0] == rms_norm) ? mul->src[1] : mul->src[0];
+
+    if (gate_inp->type != GGML_TYPE_F32 || sig->type != GGML_TYPE_F32 ||
+        shexp->type != GGML_TYPE_F32 || smul->type != GGML_TYPE_F32 ||
+        moe_out->type != GGML_TYPE_F32 || add1->type != GGML_TYPE_F32 ||
+        residual->type != GGML_TYPE_F32 || add2->type != GGML_TYPE_F32 ||
+        rms_norm->type != GGML_TYPE_F32 || mul_w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t ncols = moe_out->ne[0];
+    const int64_t nrows = ggml_nrows(moe_out);
+    if (moe_out->ne[2] != 1 || moe_out->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_are_same_shape(moe_out, shexp) || !ggml_are_same_shape(moe_out, residual) ||
+        !ggml_are_same_shape(moe_out, add2) || !ggml_are_same_shape(moe_out, mul)) {
+        return false;
+    }
+    if (gate_inp->ne[0] != 1 || ggml_nrows(gate_inp) != nrows || !ggml_is_contiguous(gate_inp)) {
+        return false;
+    }
+    if (mul_w->ne[0] != ncols || ggml_nrows(mul_w) != 1 || !ggml_is_contiguous(mul_w)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(moe_out) || !ggml_is_contiguous(shexp) ||
+        !ggml_is_contiguous(residual) || !ggml_is_contiguous(add2) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    if (check_mem_ranges) {
+        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, 6, out_nodes, 2, false)) {
+            return false;
+        }
+        // add1 is not an output, so the range check above never compares it with gate_inp.
+        const ggml_tensor * gate_base = gate_inp->view_src ? gate_inp->view_src : gate_inp;
+        if (gate_base->data && gate_base->buffer && add1->data && add1->buffer) {
+            const int64_t a_start = (int64_t) add1->data;
+            const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(add1->buffer->buft, add1);
+            const int64_t b_start = (int64_t) gate_base->data;
+            const int64_t b_end   = b_start + ggml_backend_buft_get_alloc_size(gate_base->buffer->buft, gate_base);
+            if ((b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 struct ggml_cuda_moe_weighted_reduction_match {
     const ggml_tensor * experts      = nullptr;
     const ggml_tensor * expert_scale = nullptr;
@@ -4900,6 +4986,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    if (node->op == GGML_OP_UNARY && ggml_cuda_match_shexp_add_rms_norm_mul(cgraph, i, /*check_mem_ranges=*/true)) {
+        ggml_cuda_op_rms_norm_shexp_pre_add_fused(
+            *cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+            cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 5]);
+        return 5;
+    }
+
     if (node->op == GGML_OP_ADD && ggml_cuda_match_add_rms_norm_mul(cgraph, i, /*check_mem_ranges=*/true)) {
         ggml_cuda_op_rms_norm_pre_add_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -5117,8 +5210,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (nodes_to_skip != 0) {
                     const ggml_tensor * last_fused_node = cgraph->nodes[i + nodes_to_skip];
+                    const ggml_tensor * keep_node_2 = (nodes_to_skip == 5 && node->op == GGML_OP_MUL_MAT_ID &&
+                        cgraph->nodes[i + 2]->op == GGML_OP_GLU && last_fused_node->op == GGML_OP_GLU)
+                        ? cgraph->nodes[i + 2] : nullptr;
                     for (int k = i; k <= i + nodes_to_skip; ++k) {
-                        cuda_ctx->invalidate_mmvq_q8_1_cache_range(cgraph->nodes[k]->data, ggml_nbytes(cgraph->nodes[k]), last_fused_node);
+                        cuda_ctx->invalidate_mmvq_q8_1_cache_range(cgraph->nodes[k]->data, ggml_nbytes(cgraph->nodes[k]), last_fused_node, keep_node_2);
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -5398,6 +5494,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     i = last_idx;
                     continue;
                 }
+            }
+
+            if (cgraph->nodes[i]->op == GGML_OP_UNARY && ggml_cuda_match_shexp_add_rms_norm_mul(cgraph, i, /*check_mem_ranges=*/false)) {
+                add_alloc_deps(i, i + 5);
+                i += 5;
+                continue;
             }
 
             if (cgraph->nodes[i]->op == GGML_OP_ADD && ggml_cuda_match_add_rms_norm_mul(cgraph, i, /*check_mem_ranges=*/false)) {

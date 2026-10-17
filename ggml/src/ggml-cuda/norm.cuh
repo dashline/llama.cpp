@@ -13,6 +13,14 @@ void ggml_cuda_op_rms_norm_pre_add_fused(ggml_backend_cuda_context & ctx,
                                          ggml_tensor *               rms_tensor,
                                          ggml_tensor *               mul_tensor);
 
+void ggml_cuda_op_rms_norm_shexp_pre_add_fused(ggml_backend_cuda_context & ctx,
+                                               ggml_tensor *               sig_tensor,
+                                               ggml_tensor *               shexp_mul_tensor,
+                                               ggml_tensor *               add1_tensor,
+                                               ggml_tensor *               add2_tensor,
+                                               ggml_tensor *               rms_tensor,
+                                               ggml_tensor *               mul_tensor);
+
 void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx,
                                  ggml_tensor *               rms_tensor,
                                  ggml_tensor *               mul1_tensor,
