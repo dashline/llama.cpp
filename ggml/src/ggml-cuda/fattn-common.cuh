@@ -477,7 +477,9 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
         }
     }
 
-    yq32[threadIdx.x] = q32;
+    if (ni == WARP_SIZE || threadIdx.x < ni) {
+        yq32[threadIdx.x] = q32;
+    }
     if (threadIdx.x % QI8_1 == 0 && (ni == WARP_SIZE || threadIdx.x < ni)) {
         if (std::is_same<Tds, half2>::value) {
             ((half2  *) yds)[threadIdx.x/QI8_1] =  make_half2(d, sum);

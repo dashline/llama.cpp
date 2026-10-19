@@ -166,15 +166,15 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 128, 2,  32, 128, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8,  64, 1,  32,  96,  64, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16,  64, 1,  32,  96,  64, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 1,  32, 128, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 128, 1,  32, 128, 128, 128, 1, false);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 128, 2,  32, 160, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8,  64, 1,  32,  96,  64, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16,  64, 1,  32,  96,  64, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 1,  32, 160, 128, 128, 1, false);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 128, 1,  32, 160, 128, 128, 1, false);
 
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
@@ -716,7 +716,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     // For MLA K and V have the same data.
     // Therefore, iterate over K in reverse and later re-use the data if possible.
+#if defined(AMD_WMMA_AVAILABLE)
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
     for (int k0_start = (DKQ/2-1) - (DKQ/2-1) % nbatch_K2; k0_start >= 0; k0_start -= nbatch_K2) {
         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
 
@@ -757,7 +761,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         } else {
             constexpr int stride_tile_Q = DKQ/2 + 4;
 #if defined(AMD_WMMA_AVAILABLE)
-#pragma unroll 2
+            constexpr int k_KQ_unroll = DKQ > 256 ? 1 : 2;
+#pragma unroll k_KQ_unroll
 #else
 #pragma unroll
 #endif
@@ -1071,7 +1076,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
 
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
+#if defined(AMD_WMMA_AVAILABLE)
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
     for (int i0_start = 0; i0_start < DV; i0_start += 2*nbatch_V2) {
         static_assert(DV % (2*nbatch_V2) == 0, "bad loop size");
         const int i0_stop = i0_start + 2*nbatch_V2;
@@ -1091,7 +1100,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int tile_V_offset_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? 0 : i0_start/2;
 
 #if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+#if defined(AMD_WMMA_AVAILABLE)
+        constexpr int i_VKQ_unroll = DKQ > 256 ? 1 : 8;
+#pragma unroll i_VKQ_unroll
+#else
 #pragma unroll
+#endif
         for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += T_A_VKQ::I) {
             static_assert((nbatch_fa/2) % (np*T_A_VKQ::J) == 0, "bad loop size");
 #pragma unroll
@@ -1938,7 +1952,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256) {
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || (DKQ > 256 && ncols1*ncols2 > 32)) {
         NO_DEVICE_CODE;
         return;
     }
