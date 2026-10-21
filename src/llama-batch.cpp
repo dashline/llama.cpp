@@ -616,7 +616,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool allow_gaps) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, seq_spacing spacing) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -644,17 +644,19 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             }
         }
 
-        // accept only equi-spaced increasing sequence ids (or contiguous sequence ids when !allow_gaps)
+        // accept only increasing sequence ids, spaced as requested
         if (sequential && add && !cur_seq_set.empty()) {
             const int32_t step = batch.seq_id[i][0] - last_seq_id;
-            if (allow_gaps) {
-                if (cur_seq_set.size() == 1) {
+            switch (spacing) {
+                case SEQ_SPACING_CONTIGUOUS:
+                    add = step == 1;
+                    break;
+                case SEQ_SPACING_EQUI:
+                    add = cur_seq_set.size() == 1 ? step > 0 : step == seq_id_step;
+                    break;
+                case SEQ_SPACING_ANY:
                     add = step > 0;
-                } else {
-                    add = step == seq_id_step;
-                }
-            } else {
-                add = step == 1;
+                    break;
             }
         }
 

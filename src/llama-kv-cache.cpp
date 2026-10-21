@@ -730,7 +730,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0, llama_batch_allocr::SEQ_SPACING_ANY);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -1295,7 +1295,21 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+// the streams of group ig of sinfo: first stream id, number of streams and the (constant) stream id step
+static void kv_stream_group(const llama_kv_cache::slot_info & sinfo, uint32_t ig, uint32_t & s_first, uint32_t & ns, int64_t & s_step) {
+    const auto grp = sinfo.stream_groups();
+
+    GGML_ASSERT(ig + 1 < grp.size() && "stream group index out of range");
+
+    const uint32_t b = grp[ig];
+    const uint32_t e = grp[ig + 1];
+
+    s_first = sinfo.strm[b];
+    ns      = e - b;
+    s_step  = ns > 1 ? (int64_t) sinfo.strm[b + 1] - (int64_t) sinfo.strm[b] : 1;
+}
+
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t ig) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -1305,31 +1319,24 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
-    const uint32_t ns = sinfo.n_stream();
+    uint32_t s_first;
+    uint32_t ns;
+    int64_t  s_step;
+    kv_stream_group(sinfo, ig, s_first, ns, s_step);
 
     const size_t nb1        = ggml_row_size(k->type, hparams.n_embd_head_k(il));
     const size_t nb2        = ggml_row_size(k->type, n_embd_k_gqa);
     const size_t nb3_stream = ggml_row_size(k->type, n_embd_k_gqa*kv_size);
-
-    const int64_t s_step = (ns > 1) ? ((int64_t) sinfo.strm[1] - (int64_t) sinfo.strm[0]) : 1;
-    bool equi_spaced = (s_step > 0);
-    for (uint32_t s = 2; s < ns; ++s) {
-        if ((int64_t) sinfo.strm[s] - (int64_t) sinfo.strm[s - 1] != s_step) {
-            equi_spaced = false;
-            break;
-        }
-    }
-    GGML_ASSERT(equi_spaced);
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             nb1,
             nb2,
             nb3_stream*s_step,
-            nb3_stream*sinfo.strm[0]);
+            nb3_stream*s_first);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t ig) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1340,17 +1347,10 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     // [TAG_V_CACHE_VARIABLE]
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
-    const uint32_t ns = sinfo.n_stream();
-
-    const int64_t s_step = (ns > 1) ? ((int64_t) sinfo.strm[1] - (int64_t) sinfo.strm[0]) : 1;
-    bool equi_spaced = (s_step > 0);
-    for (uint32_t s = 2; s < ns; ++s) {
-        if ((int64_t) sinfo.strm[s] - (int64_t) sinfo.strm[s - 1] != s_step) {
-            equi_spaced = false;
-            break;
-        }
-    }
-    GGML_ASSERT(equi_spaced);
+    uint32_t s_first;
+    uint32_t ns;
+    int64_t  s_step;
+    kv_stream_group(sinfo, ig, s_first, ns, s_step);
 
     if (!v_trans) {
         const size_t nb1        = ggml_row_size(v->type, hparams.n_embd_head_v(il));
@@ -1363,7 +1363,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 nb1,                    // v->nb[1]
                 nb2,                    // v->nb[2]
                 nb3_stream*s_step,      // v->nb[3]
-                nb3_stream*sinfo.strm[0]);
+                nb3_stream*s_first);
     }
 
     const size_t nb1        = ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il));
@@ -1376,7 +1376,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             nb1,                    // v->nb[1]
             nb2,                    // v->nb[2]
             nb3_stream*s_step,      // v->nb[3]
-            nb3_stream*sinfo.strm[0]);
+            nb3_stream*s_first);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2930,11 +2930,41 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    GGML_ASSERT(get_n_stream_groups() == 1 && "non-equi-spaced streams in the ubatch - use the stream group API");
+
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], 0);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    GGML_ASSERT(get_n_stream_groups() == 1 && "non-equi-spaced streams in the ubatch - use the stream group API");
+
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], 0);
+}
+
+uint32_t llama_kv_cache_context::get_n_stream_groups() const {
+    return sinfos[i_cur].stream_groups().size() - 1;
+}
+
+uint32_t llama_kv_cache_context::get_stream_group_begin(uint32_t ig) const {
+    const auto grp = sinfos[i_cur].stream_groups();
+    GGML_ASSERT(ig + 1 < grp.size());
+
+    return grp[ig];
+}
+
+uint32_t llama_kv_cache_context::get_stream_group_end(uint32_t ig) const {
+    const auto grp = sinfos[i_cur].stream_groups();
+    GGML_ASSERT(ig + 1 < grp.size());
+
+    return grp[ig + 1];
+}
+
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, uint32_t ig) const {
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], ig);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, uint32_t ig) const {
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], ig);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

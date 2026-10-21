@@ -1715,6 +1715,16 @@ private:
         if (slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
 
+            // under !kv_unified, break similarity ties towards the slot that keeps the busy set equi-spaced (see get_free_slots)
+            std::vector<int> busy_ids;
+            if (!params_base.kv_unified) {
+                for (const server_slot & slot : slots) {
+                    if (slot.is_processing()) {
+                        busy_ids.push_back(slot.id);
+                    }
+                }
+            }
+
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
                     continue;
@@ -1740,8 +1750,11 @@ private:
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
+                const bool f_sim_tie_better = f_sim_cur == f_sim_best && ret != nullptr && !params_base.kv_unified &&
+                    keeps_slots_equi_spaced(busy_ids, slot.id) && !keeps_slots_equi_spaced(busy_ids, ret->id);
+
                 // select the current slot if the criteria match
-                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
+                if ((f_sim_cur > f_sim_best || f_sim_tie_better) && f_sim_cur > slot_prompt_similarity) {
                     f_sim_best = f_sim_cur;
 
                     ret = &slot;
@@ -2469,21 +2482,45 @@ private:
         return true;
     }
 
-    // idle slots that lose the least by being reused: empty slots first, then lowest slot id under !kv_unified
-    // or least recently used under kv_unified
-    std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
-        std::vector<server_slot *> free_slots;
-        for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
-                free_slots.push_back(&slot);
+    // true if the slot ids in `ids` (sorted) plus `id` form an arithmetic progression
+    // under !kv_unified such a set of active slots is decoded through a single strided KV view
+    static bool keeps_slots_equi_spaced(const std::vector<int> & ids, int id) {
+        std::vector<int> all = ids;
+        all.insert(std::upper_bound(all.begin(), all.end(), id), id);
+
+        for (size_t i = 2; i < all.size(); ++i) {
+            if (all[i] - all[i - 1] != all[1] - all[0]) {
+                return false;
             }
         }
 
-        std::stable_sort(free_slots.begin(), free_slots.end(), [this](const server_slot * a, const server_slot * b) {
+        return true;
+    }
+
+    // idle slots that lose the least by being reused: empty slots first, then (under !kv_unified) slots that keep
+    // the set of busy slots equi-spaced and the lowest slot id, so concurrent requests pack into {0}, {0, 1}, {0, 1, 2}, ...;
+    // least recently used otherwise
+    std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
+        std::vector<server_slot *> free_slots;
+        std::vector<int>           busy_ids;
+        for (auto & slot : slots) {
+            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+                free_slots.push_back(&slot);
+            } else {
+                busy_ids.push_back(slot.id);
+            }
+        }
+
+        std::stable_sort(free_slots.begin(), free_slots.end(), [this, &busy_ids](const server_slot * a, const server_slot * b) {
             if ((a->prompt.n_tokens() == 0) != (b->prompt.n_tokens() == 0)) {
                 return a->prompt.n_tokens() == 0;
             }
             if (!params_base.kv_unified) {
+                const bool equi_a = keeps_slots_equi_spaced(busy_ids, a->id);
+                const bool equi_b = keeps_slots_equi_spaced(busy_ids, b->id);
+                if (equi_a != equi_b) {
+                    return equi_a;
+                }
                 return a->id < b->id;
             }
             return a->t_last_used < b->t_last_used;

@@ -666,7 +666,9 @@ static void test_split(testing & t) {
     });
 
     t.test("split_equal_sequential_gaps", [&](testing & t) {
-        // {0, 2}: equi-spaced (step = 2) -> single ubatch when allow_gaps = true, split when allow_gaps = false
+        using spacing = llama_batch_allocr::seq_spacing;
+
+        // {0, 2}: equi-spaced (step = 2) -> single ubatch unless contiguous spacing is required
         {
             batch_builder bb;
             bb.add(0, {0}, true);
@@ -675,24 +677,25 @@ static void test_split(testing & t) {
             llama_batch_allocr ba(1);
             t.assert_true(ba.init(bb.b, vocab, false));
 
-            llama_ubatch ub = ba.split_equal(8, true, 0, true);
+            llama_ubatch ub = ba.split_equal(8, true, 0, spacing::SEQ_SPACING_EQUI);
             t.assert_equal(2u, ub.n_tokens);
             t.assert_equal(2u, ub.n_seqs);
             t.assert_equal(0, ub.seq_id[0][0]);
             t.assert_equal(2, ub.seq_id[1][0]);
-            t.assert_equal(0u, ba.split_equal(8, true, 0, true).n_tokens);
+            t.assert_equal(0u, ba.split_equal(8, true, 0, spacing::SEQ_SPACING_EQUI).n_tokens);
 
             ba.split_reset();
-            ub = ba.split_equal(8, true, 0, false);
+            ub = ba.split_equal(8, true, 0, spacing::SEQ_SPACING_CONTIGUOUS);
             t.assert_equal(1u, ub.n_tokens);
             t.assert_equal(0, ub.seq_id[0][0]);
-            ub = ba.split_equal(8, true, 0, false);
+            ub = ba.split_equal(8, true, 0, spacing::SEQ_SPACING_CONTIGUOUS);
             t.assert_equal(1u, ub.n_tokens);
             t.assert_equal(2, ub.seq_id[0][0]);
-            t.assert_equal(0u, ba.split_equal(8, true, 0, false).n_tokens);
+            t.assert_equal(0u, ba.split_equal(8, true, 0, spacing::SEQ_SPACING_CONTIGUOUS).n_tokens);
         }
 
-        // {0, 2, 3}: non-equi-spaced -> splits into {0, 2} (step = 2) and {3} when allow_gaps = true
+        // {0, 2, 3}: non-equi-spaced -> splits into {0, 2} (step = 2) and {3} with equi spacing,
+        //   stays a single ubatch with any spacing
         {
             batch_builder bb;
             bb.add(0, {0}, true);
@@ -702,17 +705,63 @@ static void test_split(testing & t) {
             llama_batch_allocr ba(1);
             t.assert_true(ba.init(bb.b, vocab, false));
 
-            llama_ubatch ub = ba.split_equal(8, true, 0, true);
+            llama_ubatch ub = ba.split_equal(8, true, 0, spacing::SEQ_SPACING_EQUI);
             t.assert_equal(2u, ub.n_tokens);
             t.assert_equal(2u, ub.n_seqs);
             t.assert_equal(0, ub.seq_id[0][0]);
             t.assert_equal(2, ub.seq_id[1][0]);
 
-            ub = ba.split_equal(8, true, 0, true);
+            ub = ba.split_equal(8, true, 0, spacing::SEQ_SPACING_EQUI);
             t.assert_equal(1u, ub.n_tokens);
             t.assert_equal(1u, ub.n_seqs);
             t.assert_equal(3, ub.seq_id[0][0]);
-            t.assert_equal(0u, ba.split_equal(8, true, 0, true).n_tokens);
+            t.assert_equal(0u, ba.split_equal(8, true, 0, spacing::SEQ_SPACING_EQUI).n_tokens);
+
+            ba.split_reset();
+            ub = ba.split_equal(8, true, 0, spacing::SEQ_SPACING_ANY);
+            t.assert_equal(3u, ub.n_tokens);
+            t.assert_equal(3u, ub.n_seqs);
+            t.assert_equal(0, ub.seq_id[0][0]);
+            t.assert_equal(2, ub.seq_id[1][0]);
+            t.assert_equal(3, ub.seq_id[2][0]);
+            t.assert_equal(0u, ba.split_equal(8, true, 0, spacing::SEQ_SPACING_ANY).n_tokens);
+        }
+
+        // {0, 1, 3, 4} with 2 tokens per seq: a single equal-length ubatch with any spacing, two with equi spacing
+        {
+            batch_builder bb(2, nullptr, 8);
+            for (int i = 0; i < 2; ++i) {
+                bb.add(i, {0}, true);
+                bb.add(i, {1}, true);
+                bb.add(i, {3}, true);
+                bb.add(i, {4}, true);
+            }
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+
+            llama_ubatch ub = ba.split_equal(16, true, 0, spacing::SEQ_SPACING_ANY);
+            t.assert_equal(8u, ub.n_tokens);
+            t.assert_equal(4u, ub.n_seqs);
+            t.assert_equal(2u, ub.n_seq_tokens);
+            t.assert_equal(0, ub.seq_id[0][0]);
+            t.assert_equal(1, ub.seq_id[2][0]);
+            t.assert_equal(3, ub.seq_id[4][0]);
+            t.assert_equal(4, ub.seq_id[6][0]);
+            t.assert_equal(0u, ba.split_equal(16, true, 0, spacing::SEQ_SPACING_ANY).n_tokens);
+
+            ba.split_reset();
+            ub = ba.split_equal(16, true, 0, spacing::SEQ_SPACING_EQUI);
+            t.assert_equal(4u, ub.n_tokens);
+            t.assert_equal(2u, ub.n_seqs);
+            t.assert_equal(0, ub.seq_id[0][0]);
+            t.assert_equal(1, ub.seq_id[2][0]);
+            ub = ba.split_equal(16, true, 0, spacing::SEQ_SPACING_EQUI);
+            t.assert_equal(4u, ub.n_tokens);
+            t.assert_equal(2u, ub.n_seqs);
+            t.assert_equal(3, ub.seq_id[0][0]);
+            t.assert_equal(4, ub.seq_id[2][0]);
+            t.assert_equal(0u, ba.split_equal(16, true, 0, spacing::SEQ_SPACING_EQUI).n_tokens);
         }
     });
 
