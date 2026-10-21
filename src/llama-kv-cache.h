@@ -65,6 +65,35 @@ public:
             return strm.size();
         }
 
+        // partition strm[] into maximal runs of equi-spaced stream ids (left to right): run g is
+        //   strm[res[g] .. res[g + 1]) and can be read through a single strided view, see get_k()/get_v().
+        // an equi-spaced set (any 1 or 2 streams, {0, 1, 2}, {0, 2, 4}, ...) is a single run; {0, 1, 3, 4}
+        //   gives {0, 1} + {3, 4} and {0, 1, 3} gives {0, 1} + {3}, so a set of ns streams never needs more
+        //   than (ns + 1)/2 runs
+        std::vector<uint32_t> stream_groups() const {
+            const uint32_t ns = strm.size();
+
+            std::vector<uint32_t> res;
+            res.push_back(0);
+
+            uint32_t b = 0;
+            while (b < ns) {
+                uint32_t e = b + 1;
+                if (e < ns) {
+                    const int64_t step = (int64_t) strm[e] - (int64_t) strm[b];
+                    GGML_ASSERT(step > 0 && "stream ids must be strictly increasing");
+                    ++e;
+                    while (e < ns && (int64_t) strm[e] - (int64_t) strm[e - 1] == step) {
+                        ++e;
+                    }
+                }
+                res.push_back(e);
+                b = e;
+            }
+
+            return res;
+        }
+
         bool empty() const {
             return idxs.empty();
         }
@@ -192,9 +221,11 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
-    // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // get views of the current state of the cache for the stream group ig of sinfo (see slot_info::stream_groups())
+    //   - the streams of a group are equi-spaced, so the view is a single zero-copy strided 4D view [.., n_kv, .., ns_group]
+    //   - an equi-spaced sinfo has exactly one group that covers all of its streams
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t ig = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t ig = 0) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -404,8 +435,21 @@ public:
     ggml_type type_v() const;
 
     // get views of the current state of the cache
+    // the active streams of the current ubatch must be equi-spaced (a single stream group), which is always the case
+    //   unless the memory module split the batch with llama_batch_allocr::SEQ_SPACING_ANY - use the group API below then
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // stream groups of the current ubatch: the active streams partitioned into maximal equi-spaced runs,
+    //   in ubatch sequence order (see llama_kv_cache::slot_info::stream_groups())
+    //   - group ig covers the ubatch streams [get_stream_group_begin(ig), get_stream_group_end(ig))
+    //   - attention has to be dispatched once per group, each over its own K/V view
+    uint32_t get_n_stream_groups() const;
+    uint32_t get_stream_group_begin(uint32_t ig) const;
+    uint32_t get_stream_group_end  (uint32_t ig) const;
+
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t ig) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t ig) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

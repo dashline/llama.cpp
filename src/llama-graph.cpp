@@ -3054,6 +3054,77 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_attn_mha_kv(
+        const llama_kv_cache_context * mctx_cur,
+        ggml_tensor * q,
+        ggml_tensor * kq_b,
+        ggml_tensor * kq_mask,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+            int64_t   n_embd_v,
+              float   kq_scale,
+                int   il) const {
+    auto get_kv = [&](uint32_t ig, ggml_tensor * & k, ggml_tensor * & v) {
+        k = mctx_cur->get_k(ctx0, il, ig);
+        if (n_embd_v == 0) {
+            v = mctx_cur->get_v(ctx0, il, ig);
+        } else {
+            // MLA-style attention: the cached K is used as V
+            v = ggml_view_4d(ctx0, k, n_embd_v, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+        }
+    };
+
+    const uint32_t n_grp = mctx_cur->get_n_stream_groups();
+
+    if (n_grp == 1) {
+        ggml_tensor * k;
+        ggml_tensor * v;
+        get_kv(0, k, v);
+
+        return build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    }
+
+    // the active streams are not equi-spaced: attend each equi-spaced group over its own strided K/V view
+    GGML_ASSERT(kq_b == nullptr && "KQ bias is not supported with non-equi-spaced streams");
+
+    const int64_t n_stream = kq_mask->ne[3];
+    const int64_t n_tps    = q->ne[2]/n_stream; // tokens per stream
+
+    GGML_ASSERT(q->ne[2] % n_stream == 0);
+    GGML_ASSERT(kq_mask->ne[1] == n_tps);
+
+    ggml_tensor * cur = nullptr;
+
+    for (uint32_t ig = 0; ig < n_grp; ++ig) {
+        const int64_t s_begin = mctx_cur->get_stream_group_begin(ig);
+        const int64_t s_end   = mctx_cur->get_stream_group_end  (ig);
+        const int64_t ns      = s_end - s_begin;
+
+        // the tokens of a stream are consecutive along dim 2 of q, in stream order (see build_attn_mha)
+        ggml_tensor * q_g = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], n_tps*ns,
+                q->nb[1], q->nb[2], q->nb[2]*n_tps*s_begin);
+
+        ggml_tensor * kq_mask_g = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], ns,
+                kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], kq_mask->nb[3]*s_begin);
+
+        ggml_tensor * k;
+        ggml_tensor * v;
+        get_kv(ig, k, v);
+
+        GGML_ASSERT(k->ne[3] == ns);
+
+        // [n_embd_head_v*n_head, n_tps*ns]
+        ggml_tensor * cur_g = build_attn_mha(q_g, k, v, nullptr, kq_mask_g, sinks, v_mla, 0, kq_scale, il);
+        cb(cur_g, "kqv_out_grp", il);
+
+        cur = cur == nullptr ? cur_g : ggml_concat(ctx0, cur, cur_g, 1);
+    }
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
@@ -3211,14 +3282,15 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k;
-    ggml_tensor * v;
+
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    ggml_tensor * cur;
 
     if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
 
-        k = k_cur;
-        v = v_cur;
+        cur = build_attn_mha(q, k_cur, v_cur, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     } else {
         {
             const auto & k_idxs = inp->get_k_idxs();
@@ -3228,13 +3300,8 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
         }
 
-        k = mctx_cur->get_k(ctx0, il);
-        v = mctx_cur->get_v(ctx0, il);
+        cur = build_attn_mha_kv(mctx_cur, q, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     }
-
-    ggml_tensor * kq_mask = inp->get_kq_mask();
-
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -3321,11 +3388,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = inp->get_kq_mask();
 
+    // MLA-style attention: the cached K is used as V
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, kq_b, kq_mask, sinks, v_mla, v_cur->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3494,10 +3560,10 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = use_kv_cur ?
+        build_attn_mha(q, k_cur, v_cur, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il) :
+        build_attn_mha_kv(mctx_cur, q, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
@@ -3565,10 +3631,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // MLA-style attention: the cached K is used as V
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha_kv(mctx_cur, q, kq_b, kq_mask, sinks, v_mla, v_cur->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (k_rot) {

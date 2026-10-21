@@ -1257,6 +1257,22 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // build_attn_mha over the K/V cache views of mctx_cur, dispatched once per equi-spaced stream group of the
+    //   current ubatch (see llama_kv_cache_context::get_n_stream_groups()) and re-joined in ubatch token order.
+    //   q and kq_mask are sliced per group along their stream dim; the weights are untouched, so a non-equi-spaced
+    //   slot set ({0, 1, 3, 4}, {0, 1, 3}) costs one extra attention launch per layer instead of a second ubatch.
+    // n_embd_v == 0: use the V cache; otherwise V is the first n_embd_v elements of the cached K rows (MLA-style)
+    ggml_tensor * build_attn_mha_kv(
+            const llama_kv_cache_context * mctx_cur,
+            ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * kq_b,
+            ggml_tensor * kq_mask, // [n_kv, n_tokens/n_stream, 1, n_stream]
+            ggml_tensor * sinks,   // [n_head_q]
+            ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                int64_t   n_embd_v,
+                  float   kq_scale,
+                    int   il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(

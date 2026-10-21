@@ -180,11 +180,17 @@ public:
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
 
+    // how the (increasing) sequence ids of a sequential ubatch may be spaced
+    enum seq_spacing {
+        SEQ_SPACING_CONTIGUOUS, // last_seq_id + 1 only (dense stream span)
+        SEQ_SPACING_EQUI,       // any constant step (the KV cache is read through a single strided view)
+        SEQ_SPACING_ANY,        // any strictly increasing ids (the KV cache is read per equi-spaced stream group)
+    };
+
     // make ubatches of equal-length sequences sets
-    // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
-    // if allow_gaps == false, sequential sequence ids must also be contiguous (last_seq_id + 1)
+    // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids, spaced as per `spacing`
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, bool allow_gaps = true);
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, seq_spacing spacing = SEQ_SPACING_EQUI);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     // TODO: extend to support multiple _full_ sequences in the ubatch
