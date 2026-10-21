@@ -30,6 +30,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmf32s.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2031,6 +2032,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // thin f32 weights with many columns (GDN ssm_alpha/ssm_beta head projections at prefill): skip the BLAS round trip
+    if (ggml_cuda_should_use_mmf32s(src0, src1, dst)) {
+        ggml_cuda_mul_mat_f32s(ctx, src0, src1, dst);
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
