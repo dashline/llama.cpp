@@ -1038,13 +1038,14 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D> // D == head size
+template<int D, bool do_q8_1 = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        block_q8_1 * q8_dst = nullptr) {
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
@@ -1093,7 +1094,12 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    const float val = VKQ_numerator / VKQ_denominator;
+    dst[tid] = val;
+    if constexpr (do_q8_1) {
+        // dst is contiguous [D, n_head, n_tokens, n_seq]; D % QK8_1 == 0 so this block's D outputs are whole q8_1 blocks
+        quantize_lane_to_q8_1(val, q8_dst + (j_dst_unrolled*D + tid)/QK8_1, tid % QK8_1);
+    }
 }
 
 template <int DV, int ncols1, int ncols2>
@@ -1443,9 +1449,24 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
+        // Deposit a q8_1 copy of the attention output for the following wo MUL_MAT (mul_mat_vec_q cache), so decode
+        // does not need a standalone quantize_row_q8_1 launch for it. Only the contiguous [DV*n_head, n_tokens*n_seq]
+        // reshape consumer is served.
+        block_q8_1 * q8_dst = nullptr;
+        const int64_t flat_row = (int64_t) KQV->ne[0] * KQV->ne[1];
+        if (DV % QK8_1 == 0 && ggml_is_contiguous(KQV) && ggml_cuda_q8_deposit_row_ok(flat_row) &&
+            KQV->ne[2] * KQV->ne[3] <= 8 /* MMVQ_MAX_BATCH_SIZE (mmvq.cuh) */) {
+            q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(KQV, flat_row, flat_row, KQV->ne[2], KQV->ne[3], 1,
+                                                    flat_row, flat_row * KQV->ne[2], flat_row * KQV->ne[2] * KQV->ne[3]);
+        }
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        if (q8_dst != nullptr) {
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV, true>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, q8_dst);
+        } else {
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV, false>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, nullptr);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

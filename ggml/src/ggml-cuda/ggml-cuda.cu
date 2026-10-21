@@ -5430,7 +5430,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
-                cuda_ctx->invalidate_mmvq_q8_1_cache_range(node->data, ggml_nbytes(node));
+                // keep a q8_1 slot the op just deposited for its own output (FA combine, non-fused GLU); anything else
+                // aliasing this memory is stale now
+                cuda_ctx->invalidate_mmvq_q8_1_cache_range(node->data, ggml_nbytes(node), node);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

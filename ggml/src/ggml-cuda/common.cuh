@@ -681,16 +681,33 @@ static __device__ __forceinline__ void quantize_float4_to_q8_1(
     const float d = amax / 127.0f;
     int32_t q4 = 0;
     if (amax != 0.0f) {
-        const float id = 127.0f / amax;
-        const uint8_t q0 = (uint8_t)(int8_t) roundf(v0 * id);
-        const uint8_t q1 = (uint8_t)(int8_t) roundf(v1 * id);
-        const uint8_t q2 = (uint8_t)(int8_t) roundf(v2 * id);
-        const uint8_t q3 = (uint8_t)(int8_t) roundf(v3 * id);
+        // roundf(v / d), not v * (127/amax): keeps the deposit bit-identical to quantize_q8_1 (quantize.cu)
+        const uint8_t q0 = (uint8_t)(int8_t) roundf(v0 / d);
+        const uint8_t q1 = (uint8_t)(int8_t) roundf(v1 / d);
+        const uint8_t q2 = (uint8_t)(int8_t) roundf(v2 / d);
+        const uint8_t q3 = (uint8_t)(int8_t) roundf(v3 / d);
         q4 = (int32_t)(uint32_t(q0) | (uint32_t(q1) << 8) | (uint32_t(q2) << 16) | (uint32_t(q3) << 24));
     }
     reinterpret_cast<int32_t *>(y_row[ib].qs)[sub] = q4;
     if (sub == 0) {
         y_row[ib].ds = make_half2(d, sum);
+    }
+}
+
+// Scalar sibling of quantize_float4_to_q8_1: lanes 32*b .. 32*b+31 of a warp hold one q8_1 block each.
+static __device__ __forceinline__ void quantize_lane_to_q8_1(const float val, block_q8_1 * y_block, const int lane) {
+    float amax = fabsf(val);
+    float sum  = val;
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 32));
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, mask, 32);
+    }
+    const float  d = amax / 127.0f;
+    const int8_t q = (amax == 0.0f) ? 0 : (int8_t) roundf(val / d);
+    y_block->qs[lane] = q;
+    if (lane == 0) {
+        y_block->ds = make_half2(d, sum);
     }
 }
 
@@ -1476,6 +1493,14 @@ struct ggml_cuda_stream_context {
         concurrent_events.clear();
     }
 };
+
+
+// Row-length requirement for a producer-side q8_1 deposit into the mmvq cache. The deposit kernels write rows at
+// stride ne0/QK8_1 blocks (no padding) and mul_mat_vec_q only ever reads blocks_per_row_x real blocks per row, so
+// ne0 % QK8_1 == 0 is sufficient; the consumer picks the stride up from the slot.
+static inline bool ggml_cuda_q8_deposit_row_ok(int64_t ne0) {
+    return ne0 > 0 && ne0 % QK8_1 == 0;
+}
 
 struct ggml_backend_cuda_context {
     int device;

@@ -1740,7 +1740,9 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
-    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    // row stride (in elements) of the q8_1 copy of src1: padded when we quantize here, but a producer-side deposit
+    // (see ggml_cuda_q8_deposit_row_ok) may have written rows at stride ne10; on a cache hit the slot's stride wins.
+    int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_1_nbytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
     const int64_t s11_src1    = src1->nb[1] / ts_src1;
     const int64_t s12_src1    = src1->nb[2] / ts_src1;
@@ -1761,27 +1763,50 @@ void ggml_cuda_mul_mat_vec_q(
         const bool is_contig_2d = ggml_is_contiguous(src1) &&
             ((ne12 == 1 && ne13 == 1) || (ne11 == 1 && ne13 == 1));
         const int64_t total_rows = ne11 * ne12 * ne13;
+        // A contiguous src1 that is a zero-offset view (reshape / permute / view) of some producer reads the producer's
+        // bytes in memory order, so a flat (unpadded) q8_1 deposit of the producer can be re-rowed for it as long as
+        // both row lengths are whole q8_1 blocks. flat_base is the producer for that lookup.
+        const ggml_tensor * flat_base = src1;
+        if (is_contig_2d) {
+            while (flat_base->view_src != nullptr && flat_base->view_offs == 0 &&
+                   (flat_base->op == GGML_OP_RESHAPE || flat_base->op == GGML_OP_PERMUTE ||
+                    flat_base->op == GGML_OP_VIEW || flat_base->op == GGML_OP_TRANSPOSE)) {
+                flat_base = flat_base->view_src;
+            }
+        }
+        const int64_t total_elems = ne10 * total_rows;
 
         auto * slots = ctx.mmvq_q8_1_cache[ctx.device][ctx.curr_stream_no];
         uint64_t & tick = ctx.mmvq_q8_1_cache_tick[ctx.device][ctx.curr_stream_no];
 
         int hit_slot = -1;
+        int64_t hit_ne10_padded = 0;
         for (int k = 0; k < ggml_backend_cuda_context::MMVQ_Q8_1_CACHE_SLOTS; ++k) {
             const auto & slot = slots[k];
-            if (slot.ptr == nullptr || slot.src1_tensor != base_src1 || slot.src1_data != src1_d ||
-                slot.ne10 != ne10 || slot.ne10_padded != ne10_padded) {
+            if (slot.ptr == nullptr || slot.src1_data != src1_d || slot.ne10_padded % QK8_1 != 0) {
                 continue;
             }
-            const bool exact_match =
-                slot.ne11 == ne11 && slot.ne12 == ne12 && slot.ne13 == ne13 &&
-                slot.s11 == s11_src1 && slot.s12 == s12_src1 && slot.s13 == s13_src1;
             const bool slot_is_contig_2d =
                 ((slot.ne12 == 1 && slot.ne13 == 1 && slot.s11 == slot.ne10) ||
                  (slot.ne11 == 1 && slot.ne13 == 1 && slot.s12 == slot.ne10));
-            const bool contig_reshape_match =
-                is_contig_2d && slot_is_contig_2d && (slot.ne11 * slot.ne12 * slot.ne13 == total_rows);
-            if (exact_match || contig_reshape_match) {
+            const bool slot_is_flat = slot_is_contig_2d && slot.ne10_padded == slot.ne10 && slot.ne10 % QK8_1 == 0;
+            if (slot.src1_tensor == base_src1 && slot.ne10 == ne10 && slot.ne10_padded >= ne10) {
+                const bool exact_match =
+                    slot.ne11 == ne11 && slot.ne12 == ne12 && slot.ne13 == ne13 &&
+                    slot.s11 == s11_src1 && slot.s12 == s12_src1 && slot.s13 == s13_src1;
+                const bool contig_reshape_match =
+                    is_contig_2d && slot_is_contig_2d && (slot.ne11 * slot.ne12 * slot.ne13 == total_rows);
+                if (exact_match || contig_reshape_match) {
+                    hit_slot = k;
+                    hit_ne10_padded = slot.ne10_padded;
+                    break;
+                }
+            }
+            // flat re-row of a producer deposit (different row length, same bytes)
+            if (slot_is_flat && is_contig_2d && ne10 % QK8_1 == 0 && slot.src1_tensor == flat_base &&
+                slot.ne10 * slot.ne11 * slot.ne12 * slot.ne13 == total_elems) {
                 hit_slot = k;
+                hit_ne10_padded = ne10;
                 break;
             }
         }
@@ -1789,6 +1814,7 @@ void ggml_cuda_mul_mat_vec_q(
         if (hit_slot >= 0) {
             slots[hit_slot].last_use = ++tick;
             src1_q8_1_ptr = slots[hit_slot].ptr;
+            ne10_padded   = hit_ne10_padded;
         } else {
             int victim = 0;
             for (int k = 0; k < ggml_backend_cuda_context::MMVQ_Q8_1_CACHE_SLOTS; ++k) {
@@ -1833,7 +1859,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion != nullptr && fusion->gate != nullptr) {
         const int64_t ncols_dst_deposit = ids ? ne2 : ne1;
         const bool deposit_rows_ok = mmvq_q8_deposit_rows_ok(src0->type, (int) ncols_dst_deposit, ids != nullptr);
-        if (deposit_rows_ok && ne0 % MATRIX_ROW_PADDING == 0 && ne0 % QK8_1 == 0 && ggml_is_contiguous(dst) && ne1 * ne2 * ne3 <= 64) {
+        if (deposit_rows_ok && ggml_cuda_q8_deposit_row_ok(ne0) && ggml_is_contiguous(dst) && ne1 * ne2 * ne3 <= 64) {
             fusion_local.q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(
                 dst, ne0, ne0, ne1, ne2, ne3, ne0, ne0 * ne1, ne0 * ne1 * ne2,
                 &fusion_local.q8_retire_cnt, 0, stream);
@@ -1845,7 +1871,7 @@ void ggml_cuda_mul_mat_vec_q(
             const int64_t s_ne3 = fusion->shared_dst->ne[3];
             // Shared expert is the non-id mul_mat_vec_q lane (rows_per_block from ncols = s_ne1).
             const bool shared_rows_ok = mmvq_q8_deposit_rows_ok(src0->type, (int) s_ne1, /*has_ids=*/false);
-            if (shared_rows_ok && s_ne0 % MATRIX_ROW_PADDING == 0 && s_ne0 % QK8_1 == 0 && ggml_is_contiguous(fusion->shared_dst) && s_ne1 * s_ne2 * s_ne3 <= 64) {
+            if (shared_rows_ok && ggml_cuda_q8_deposit_row_ok(s_ne0) && ggml_is_contiguous(fusion->shared_dst) && s_ne1 * s_ne2 * s_ne3 <= 64) {
                 fusion_local.shared_q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(
                     fusion->shared_dst, s_ne0, s_ne0, s_ne1, s_ne2, s_ne3, s_ne0, s_ne0 * s_ne1, s_ne0 * s_ne1 * s_ne2,
                     &fusion_local.shared_q8_retire_cnt, 1, stream);
