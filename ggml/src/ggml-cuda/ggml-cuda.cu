@@ -5352,6 +5352,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             cuda_ctx->reset_mmvq_q8_1_cache();
+            cuda_ctx->collect_mmvq_q8_consumers(cgraph);
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];

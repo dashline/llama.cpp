@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1660,6 +1661,34 @@ struct ggml_backend_cuda_context {
     mmvq_q8_1_cache_slot mmvq_q8_1_cache[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS][MMVQ_Q8_1_CACHE_SLOTS];
     uint64_t mmvq_q8_1_cache_tick[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
 
+    // Tensors some MUL_MAT / MUL_MAT_ID of the graph being evaluated reads as src1, directly or as the root of a
+    // zero-offset reshape/permute/view chain (what the mmvq cache lookup matches on). Producer-side q8_1 deposits are
+    // only made for these; a q/k norm output that feeds RoPE, for example, has no consumer and would be a dead deposit.
+    // Filled by ggml_backend_cuda_graph_compute before the node loop.
+    std::unordered_set<const ggml_tensor *> mmvq_q8_consumer_srcs;
+    bool mmvq_q8_consumer_filter = false;
+
+    void collect_mmvq_q8_consumers(const ggml_cgraph * cgraph) {
+        mmvq_q8_consumer_srcs.clear();
+        mmvq_q8_consumer_filter = true;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            const ggml_tensor * t = node->src[1];
+            while (t != nullptr) {
+                mmvq_q8_consumer_srcs.insert(t);
+                if (t->view_src == nullptr || t->view_offs != 0 ||
+                    (t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE &&
+                     t->op != GGML_OP_VIEW && t->op != GGML_OP_TRANSPOSE)) {
+                    break;
+                }
+                t = t->view_src;
+            }
+        }
+    }
+
     // Retire counters for the fused q8_1 deposit in mul_mat_vec_q. Every counter is bumped
     // with atomicInc(.., target - 1) by exactly `target` blocks per launch, so it wraps back
     // to 0 by the time the kernel completes: the arena only has to be zeroed when it is
@@ -1736,6 +1765,9 @@ struct ggml_backend_cuda_context {
             int retire_region = 0,
             cudaStream_t stream = nullptr) {
         if (!src1_tensor || !src1_tensor->data || !src1_tensor->buffer) {
+            return nullptr;
+        }
+        if (mmvq_q8_consumer_filter && mmvq_q8_consumer_srcs.count(src1_tensor) == 0) {
             return nullptr;
         }
         const size_t src1_nbytes = ggml_nbytes(src1_tensor);
