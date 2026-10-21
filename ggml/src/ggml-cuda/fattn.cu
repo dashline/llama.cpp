@@ -428,6 +428,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE( 64, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(128, type_K_case, type_V_case)       \
     FATTN_VEC_CASE(256, type_K_case, type_V_case)       \
+    FATTN_VEC_CASE(512, type_K_case, type_V_case)       \
+    FATTN_VEC_CASE(576, type_K_case, type_V_case)       \
 
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -572,6 +574,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int cc = ggml_cuda_info().devices[device].cc;
 
+    // Block-per-lane quantized vec kernel (fattn-vec.cuh KQ_blk); for DKQ == 512 / 576 it is the only vec instance with device code.
+    const bool kv_is_q8_or_q4 = (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) &&
+                                (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
+    const bool vec_blk_available = (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) && kv_is_q8_or_q4;
+    const bool can_use_vec_blk_wide = vec_blk_available && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[1] <= 8 &&
+        (K->ne[0] == 512 || K->ne[0] == 576);
+
     switch (K->ne[0]) {
         case  40:
         case  64:
@@ -605,7 +614,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
+            if (!gqa_opt_applies && !can_use_vec_blk_wide) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
@@ -613,7 +622,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
+            if (!gqa_opt_applies && !can_use_vec_blk_wide) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
@@ -631,7 +640,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // 320 also has no vec instance; 512 (Gemma 4) and 576 (absorbed MLA, DV == 512) only have the RDNA3/RDNA4 q8_0/q4_0 block-per-lane instance.
+    const bool can_use_vector_kernel = (Q->ne[0] <= 256 || (vec_blk_available && (Q->ne[0] == 512 || (Q->ne[0] == 576 && V->ne[0] == 512)))) &&
+        Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -696,17 +707,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    // When K and V are q8_0/q4_0 and the vector kernel applies at small Q->ne[1] <= 8 (for D == 128 or D == 256),
+    // When K and V are q8_0/q4_0 and the vector kernel applies at small Q->ne[1] <= 8 (for D == 128, 256, 512, or 576),
     // prefer the vector kernel to avoid dequantizing the entire KV cache to FP16 on every attention call.
-    const bool kv_is_q8_or_q4 = (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) &&
-                                (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
-    const int max_cols_vec_quant = ((GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) &&
-                                    (Q->ne[0] == 128 || Q->ne[0] == 256) && kv_is_q8_or_q4) ? 8 : 2;
+    const int max_cols_vec_quant = (vec_blk_available &&
+                                    (Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512 || Q->ne[0] == 576)) ? 8 : 2;
     const bool prefer_vec_quant = can_use_vector_kernel &&
         max_cols_vec_quant == 8 &&
         Q->ne[1] <= max_cols_vec_quant;
     if (!prefer_vec_quant &&
-            (amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+            (amd_wmma_available(cc) && gqa_opt_applies && (Q->ne[0] <= 256 || Q->ne[0] == 512 || Q->ne[0] == 576)) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
