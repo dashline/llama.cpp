@@ -1049,7 +1049,7 @@ void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_c
     p.out    = (float *) m.out->data;
 
     const int64_t flat_row = (int64_t) S_v * H;
-    if (flat_row % MATRIX_ROW_PADDING == 0 && (int64_t) T * n_seqs <= MMVQ_MAX_BATCH_SIZE) {
+    if (ggml_cuda_q8_deposit_row_ok(flat_row) && (int64_t) T * n_seqs <= MMVQ_MAX_BATCH_SIZE) {
         p.q8_out = ctx.alloc_mmvq_q8_1_cache_slot(m.out, flat_row, flat_row, T, n_seqs, 1,
                                                   flat_row, flat_row * T, flat_row * T * n_seqs);
     }

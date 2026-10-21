@@ -30,6 +30,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmf32s.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2031,6 +2032,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // thin f32 weights with many columns (GDN ssm_alpha/ssm_beta head projections at prefill): skip the BLAS round trip
+    if (ggml_cuda_should_use_mmf32s(src0, src1, dst)) {
+        ggml_cuda_mul_mat_f32s(ctx, src0, src1, dst);
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
@@ -5430,7 +5436,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
-                cuda_ctx->invalidate_mmvq_q8_1_cache_range(node->data, ggml_nbytes(node));
+                // keep a q8_1 slot the op just deposited for its own output (FA combine, non-fused GLU); anything else
+                // aliasing this memory is stale now
+                cuda_ctx->invalidate_mmvq_q8_1_cache_range(node->data, ggml_nbytes(node), node);
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

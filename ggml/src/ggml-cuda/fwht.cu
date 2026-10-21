@@ -5,9 +5,9 @@
 // wide FWHT blocks use one row per thread block with this many threads
 #define GGML_CUDA_FWHT_BLOCK_NT 256
 
-template <int N, typename T>
+template <int N, typename T, bool do_q8_1 = false>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
-__global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale) {
+__global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale, block_q8_1 * q8_dst = nullptr) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
@@ -60,14 +60,21 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
     for (int i = 0; i < el_w; ++i) {
         dst[i * warp_size + lane] = reg[i];
     }
+    if constexpr (do_q8_1 && warp_size == QK8_1) {
+        // the 32 lanes hold 32 consecutive outputs: one q8_1 block per i (host only enables this for 32-wide warps)
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            quantize_lane_to_q8_1(reg[i], q8_dst + r * (N / QK8_1) + i, lane);
+        }
+    }
 }
 
 // Wide blocks: one row per thread block instead of per warp, so each thread keeps N/NT
 // values rather than N/32. Stages below the warp width still shuffle, those up to the
 // block width go through shared memory, and the rest stay in registers.
-template <int N, int NT, typename T>
+template <int N, int NT, typename T, bool do_q8_1 = false>
 __launch_bounds__(NT, 1)
-__global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale) {
+__global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows, const float scale, block_q8_1 * q8_dst = nullptr) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
     static_assert(NE >= 1 && N % NT == 0 && NT % warp_size == 0, "bad FWHT block shape");
@@ -141,6 +148,13 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
     for (int i = 0; i < NE; ++i) {
         dst[i * NT + tid] = reg[i];
     }
+    if constexpr (do_q8_1) {
+        // 32 consecutive tids hold 32 consecutive outputs for each i: block (i*NT + tid)/32, lane tid%32
+#pragma unroll
+        for (int i = 0; i < NE; ++i) {
+            quantize_lane_to_q8_1(reg[i], q8_dst + r * (N / QK8_1) + (i * NT + tid) / QK8_1, tid % QK8_1);
+        }
+    }
 }
 
 template <typename T>
@@ -164,22 +178,26 @@ static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_t
 
     const float scale = 1 / sqrtf(n);
 
+    // Decode-sized Hadamard outputs (e.g. the rotated attention output feeding wo) get a flat q8_1 deposit for the
+    // mul_mat_vec_q cache; the consumer re-rows it (mmvq.cu flat_base).
+    block_q8_1 * q8_dst = nullptr;
+    if (warp_size == QK8_1 && n % QK8_1 == 0 && rows * n <= 8 * 16384 && ggml_is_contiguous(dst)) {
+        q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(dst, n, n, rows, 1, 1, n, (int64_t) n * rows, (int64_t) n * rows);
+    }
+
+#define FWHT_LAUNCH_WARP(NN) \
+    if (q8_dst != nullptr) { ggml_cuda_kernel_launch(fwht_cuda<NN, T, true>, launch_params, src_d, dst_d, rows, scale, q8_dst); } \
+    else { ggml_cuda_kernel_launch(fwht_cuda<NN, T, false>, launch_params, src_d, dst_d, rows, scale, nullptr); } \
+    return true;
     switch (n) {
-        case 64:
-            ggml_cuda_kernel_launch(fwht_cuda<64, T>, launch_params, src_d, dst_d, rows, scale);
-            return true;
-        case 128:
-            ggml_cuda_kernel_launch(fwht_cuda<128, T>, launch_params, src_d, dst_d, rows, scale);
-            return true;
-        case 256:
-            ggml_cuda_kernel_launch(fwht_cuda<256, T>, launch_params, src_d, dst_d, rows, scale);
-            return true;
-        case 512:
-            ggml_cuda_kernel_launch(fwht_cuda<512, T>, launch_params, src_d, dst_d, rows, scale);
-            return true;
+        case 64:  FWHT_LAUNCH_WARP(64)
+        case 128: FWHT_LAUNCH_WARP(128)
+        case 256: FWHT_LAUNCH_WARP(256)
+        case 512: FWHT_LAUNCH_WARP(512)
         default:
             break;
     }
+#undef FWHT_LAUNCH_WARP
 
     // wide blocks: one row per thread block
     {
@@ -190,25 +208,22 @@ static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_t
         const ggml_cuda_kernel_launch_params launch_params_w =
             ggml_cuda_kernel_launch_params(grid_dims_w, block_dims_w, 0, stream);
 
+#define FWHT_LAUNCH_BLOCK(NN) \
+    if (q8_dst != nullptr) { ggml_cuda_kernel_launch(fwht_cuda_block<NN, nt, T, true>, launch_params_w, src_d, dst_d, rows, scale, q8_dst); } \
+    else { ggml_cuda_kernel_launch(fwht_cuda_block<NN, nt, T, false>, launch_params_w, src_d, dst_d, rows, scale, nullptr); } \
+    return true;
         switch (n) {
-            case 1024:
-                ggml_cuda_kernel_launch(fwht_cuda_block<1024, nt, T>, launch_params_w, src_d, dst_d, rows, scale);
-                return true;
-            case 2048:
-                ggml_cuda_kernel_launch(fwht_cuda_block<2048, nt, T>, launch_params_w, src_d, dst_d, rows, scale);
-                return true;
-            case 4096:
-                ggml_cuda_kernel_launch(fwht_cuda_block<4096, nt, T>, launch_params_w, src_d, dst_d, rows, scale);
-                return true;
+            case 1024: FWHT_LAUNCH_BLOCK(1024)
+            case 2048: FWHT_LAUNCH_BLOCK(2048)
+            case 4096: FWHT_LAUNCH_BLOCK(4096)
 #if !defined(GGML_USE_MUSA)
             // 32 KB of shared memory, above the MUSA limit; falls back there
-            case 8192:
-                ggml_cuda_kernel_launch(fwht_cuda_block<8192, nt, T>, launch_params_w, src_d, dst_d, rows, scale);
-                return true;
+            case 8192: FWHT_LAUNCH_BLOCK(8192)
 #endif // !defined(GGML_USE_MUSA)
             default:
                 return false;
         }
+#undef FWHT_LAUNCH_BLOCK
     }
 }
 

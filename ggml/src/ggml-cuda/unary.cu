@@ -414,7 +414,7 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         block_q8_1 * q8_dst = nullptr;
         const int64_t k     = ggml_nelements(dst);
         const int64_t nrows = ggml_nrows(dst);
-        if (nc % MATRIX_ROW_PADDING == 0 && k % QK8_1 == 0 && nrows <= 64 && ggml_is_contiguous(dst)) {
+        if (ggml_cuda_q8_deposit_row_ok(nc) && k % QK8_1 == 0 && nrows <= 64 && ggml_is_contiguous(dst)) {
             const int64_t ne00 = dst->ne[0];
             const int64_t ne01 = dst->ne[1];
             const int64_t ne02 = dst->ne[2];
@@ -782,7 +782,7 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     } else {
         block_q8_1 * q8_dst = nullptr;
         const int64_t nrows = ggml_nrows(mul_node);
-        if (nc % MATRIX_ROW_PADDING == 0 && k % QK8_1 == 0 && nrows <= 64 && ggml_is_contiguous(mul_node)) {
+        if (ggml_cuda_q8_deposit_row_ok(nc) && k % QK8_1 == 0 && nrows <= 64 && ggml_is_contiguous(mul_node)) {
             const int64_t ne00 = mul_node->ne[0];
             const int64_t ne01 = mul_node->ne[1];
             const int64_t ne02 = mul_node->ne[2];

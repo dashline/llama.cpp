@@ -938,7 +938,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
         && ggml_cuda_is_aligned(mul_src, 16);
 
     block_q8_1 * q8_dst = nullptr;
-    if (can_vec_q8_1 && ne00 % MATRIX_ROW_PADDING == 0 && ne01 * ne02 * ne03 <= MMVQ_MAX_BATCH_SIZE && ggml_is_contiguous(mul_tensor)) {
+    if (can_vec_q8_1 && ggml_cuda_q8_deposit_row_ok(ne00) && ne01 * ne02 * ne03 <= MMVQ_MAX_BATCH_SIZE && ggml_is_contiguous(mul_tensor)) {
         q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(mul_tensor, ne00, ne00, ne01, ne02, ne03, ne00, ne00 * ne01, ne00 * ne01 * ne02);
     }
 
@@ -1032,7 +1032,7 @@ static void ggml_cuda_op_rms_norm_pre_add_fused_impl(ggml_backend_cuda_context &
         && ggml_cuda_is_aligned(mul_src, 16);
 
     block_q8_1 * q8_dst = nullptr;
-    if (can_vec_q8_1 && ne00 % MATRIX_ROW_PADDING == 0 && ne01 * ne02 * ne03 <= MMVQ_MAX_BATCH_SIZE && ggml_is_contiguous(mul_tensor)) {
+    if (can_vec_q8_1 && ggml_cuda_q8_deposit_row_ok(ne00) && ne01 * ne02 * ne03 <= MMVQ_MAX_BATCH_SIZE && ggml_is_contiguous(mul_tensor)) {
         q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(mul_tensor, ne00, ne00, ne01, ne02, ne03, ne00, ne00 * ne01, ne00 * ne01 * ne02);
     }
 
@@ -1182,7 +1182,7 @@ void ggml_cuda_op_rms_norm_gated(ggml_backend_cuda_context & ctx,
 
     block_q8_1 * q8_dst = nullptr;
     const int64_t flat_row = (int64_t) ncols * nrows;
-    if (vec && ncols % QK8_1 == 0 && flat_row % MATRIX_ROW_PADDING == 0 && nchannels * nsamples <= MMVQ_MAX_BATCH_SIZE && ggml_is_contiguous(mul2_tensor)) {
+    if (vec && ncols % QK8_1 == 0 && ggml_cuda_q8_deposit_row_ok(flat_row) && nchannels * nsamples <= MMVQ_MAX_BATCH_SIZE && ggml_is_contiguous(mul2_tensor)) {
         q8_dst = ctx.alloc_mmvq_q8_1_cache_slot(mul2_tensor, flat_row, flat_row, nchannels, nsamples, 1, flat_row, flat_row * nchannels, flat_row * nchannels * nsamples);
     }
 
