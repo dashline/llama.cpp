@@ -601,6 +601,9 @@ struct clip_model {
     ggml_tensor * pre_ln_w = nullptr;
     ggml_tensor * pre_ln_b = nullptr;
 
+    // magevl: constant rotation matrix for interleaved rotate_half (d_head x d_head, f32)
+    ggml_tensor * rope_rotmat = nullptr;
+
     std::vector<clip_layer> layers;
 
     // one patch embedder per audio pyramid stage (muse-spark)

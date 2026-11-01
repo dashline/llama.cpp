@@ -537,6 +537,7 @@ enum projector_type {
     PROJECTOR_TYPE_MUSE_GLIMMER,
     PROJECTOR_TYPE_COHERE2V,
     PROJECTOR_TYPE_MUSE_SPARK_AUDIO,
+    PROJECTOR_TYPE_MAGEVL,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -611,6 +612,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
     { PROJECTOR_TYPE_COHERE2V,          "cohere2v"},
     { PROJECTOR_TYPE_MUSE_SPARK_AUDIO,  "muse-spark-audio"},
+    { PROJECTOR_TYPE_MAGEVL,            "magevl"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {
@@ -739,6 +741,9 @@ struct clip_image_f32 {
     int32_t lead_pad = 0;
     // separators appended after the image tokens
     clip_suffix_type suffix_type = CLIP_SUFFIX_NONE;
+    // temporal (frame) index within the current video segment; used by magevl
+    // to build the t-axis of its 3D RoPE. 0 for plain images.
+    int temporal_idx = 0;
 
     // tile grid of the image group this entry belongs to
     // llava-next "anyres" (Granite4 Vision): the whole grid is encoded and assembled in a single graph

@@ -997,6 +997,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_qwen2vl>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_MAGEVL:
+            {
+                builder = std::make_unique<clip_graph_magevl>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_QWEN3VL:
             {
                 builder = std::make_unique<clip_graph_qwen3vl>(ctx, img);
@@ -1768,6 +1772,25 @@ struct clip_model_loader {
                             LOG_WRN("%s: if you encounter problems with accuracy, try adding --image-min-tokens 1024\n", __func__);
                             LOG_WRN("%s: more info: https://github.com/ggml-org/llama.cpp/issues/16842\n\n", __func__);
                         }
+                    } break;
+                case PROJECTOR_TYPE_MAGEVL:
+                    {
+                        hparams.n_merge = 2; // spatial_merge_size
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                        hparams.image_resize_pad  = PAD_NONE;
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        GGML_ASSERT(hparams.n_merge == 2);
+                        hparams.set_limit_image_tokens(8, 4096);
+                        if (hparams.custom_image_min_tokens <= 0) {
+                            get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
+                        }
+                        if (hparams.custom_image_max_tokens <= 0) {
+                            get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
+                        }
+                        hparams.rope_theta = 10000.0f; // vision_config.rope_theta
+                        get_f32("clip.vision.rope_theta", hparams.rope_theta, false);
+                        // warmup on the config image_size (448x448), avoids OOM on load
+                        hparams.warmup_image_size = hparams.image_size;
                     } break;
                 case PROJECTOR_TYPE_MINIMAX_M3:
                     {
@@ -2636,6 +2659,18 @@ struct clip_model_loader {
                     model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                } break;
+            case PROJECTOR_TYPE_MAGEVL:
+                {
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    // merger ln_q (LayerNorm over n_embd, applied before 4-patch grouping)
+                    model.mm_input_norm_w = get_tensor(TN_MM_INP_NORM);
+                    model.mm_input_norm_b = get_tensor(TN_MM_INP_NORM_B);
+                    // constant rotation matrix for the interleaved vision RoPE
+                    model.rope_rotmat = get_tensor("v.rope_rotmat.weight");
                 } break;
             case PROJECTOR_TYPE_QWEN3VL:
                 {
@@ -4280,6 +4315,7 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_MAGEVL:
         case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
@@ -4310,6 +4346,7 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_MAGEVL:
         case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
@@ -4395,6 +4432,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
+        case PROJECTOR_TYPE_MAGEVL:
         case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_MIMOVL:
@@ -5180,6 +5218,66 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 }
 
                 set_input_i32("positions", positions);
+            } break;
+        case PROJECTOR_TYPE_MAGEVL:
+            {
+                const int pw = image_size_width  / patch_size;
+                const int ph = image_size_height / patch_size;
+                GGML_ASSERT(pw >= 2 && pw % 2 == 0 && ph >= 2 && ph % 2 == 0);
+                const int t_idx = imgs.entries[0].temporal_idx;
+
+                // block-order position of the k-th patch (matches HF 2x2 block layout)
+                auto block_pos = [pw](int k, int & h, int & w) {
+                    const int bi = k / 4, j = k % 4;
+                    const int hb = bi / (pw / 2), wb = bi % (pw / 2);
+                    const int dy = j / 2, dx = j % 2;
+                    h = hb * 2 + dy;
+                    w = wb * 2 + dx;
+                };
+
+                // 1) permutation: k-th block-order patch -> row-major patch index
+                std::vector<int32_t> perm(n_pos);
+                for (int k = 0; k < n_pos; k++) {
+                    int h, w;
+                    block_pos(k, h, w);
+                    perm[k] = h * pw + w;
+                }
+                set_input_i32("patch_perm", perm);
+
+                // 2) rope cos/sin, layout [d_head, n_pos] (dim0 fastest)
+                //    replicates VisionRotaryEmbedding + interleaved rotate_half:
+                //    f32 freqs f = [t*inv_t(8), h*inv_h(12), w*inv_w(12)], then cat([f, f])
+                const int d_head = hparams.n_embd / hparams.n_head;
+                GGML_ASSERT(d_head >= 32 && d_head % 32 == 0 && d_head <= 128);
+                const int half   = d_head / 2;
+                const int unit   = half / 16;
+                const int t_sz   = 4 * unit;
+                const int h_sz   = 6 * unit;
+                const int w_sz   = 6 * unit;
+                const double base = hparams.rope_theta > 0 ? (double) hparams.rope_theta : 10000.0;
+
+                std::vector<double> inv_t(t_sz), inv_h(h_sz), inv_w(w_sz);
+                for (int i = 0; i < t_sz; i++) inv_t[i] = 1.0 / std::pow(base, (double) i / t_sz);
+                for (int i = 0; i < h_sz; i++) inv_h[i] = 1.0 / std::pow(base, (double) i / h_sz);
+                for (int i = 0; i < w_sz; i++) inv_w[i] = 1.0 / std::pow(base, (double) i / w_sz);
+
+                std::vector<float> cos_v((size_t) d_head * n_pos);
+                std::vector<float> sin_v((size_t) d_head * n_pos);
+                for (int k = 0; k < n_pos; k++) {
+                    int h, w;
+                    block_pos(k, h, w);
+                    double f[128];
+                    for (int i = 0; i < t_sz; i++) f[i] = t_idx * inv_t[i];
+                    for (int i = 0; i < h_sz; i++) f[t_sz + i] = h * inv_h[i];
+                    for (int i = 0; i < w_sz; i++) f[t_sz + h_sz + i] = w * inv_w[i];
+                    for (int i = 0; i < half; i++) f[half + i] = f[i]; // cat([f, f])
+                    for (int i = 0; i < d_head; i++) {
+                        cos_v[(size_t) k * d_head + i] = (float) std::cos(f[i]);
+                        sin_v[(size_t) k * d_head + i] = (float) std::sin(f[i]);
+                    }
+                }
+                set_input_f32("rope_cos", cos_v);
+                set_input_f32("rope_sin", sin_v);
             } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
@@ -6335,6 +6433,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
+        case PROJECTOR_TYPE_MAGEVL:
         case PROJECTOR_TYPE_EXAONE4_5:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_YOUTUVL:
